@@ -952,6 +952,48 @@ void do_deduplicated_lookup(unsigned char **keywords, size_t keywords_num) {
 		keywords_num, lookup_time, index_lookup_time, reverse_lookup_time, fingerprints.size(), results.size() + results_set.size() + actual_results_set.size() + results_with_offsets.size() + results_with_freqs.size(), external_reverse_mapping_load_time, jcr.reverse_mapping_get_files_time, indirection_time, searcher_load_time, dtor_time, lookup_time - dtor_time);
 }
 
+void do_deduplicated_lookup_using_parser(const std::string& query) {
+	/**
+	 * Assuming no offsets, no ranking, in-doc reverse mapping and indirect-path-strings
+	 */
+	double total_lookup_time = 0, index_lookup_time = 0, indirection_time = 0;
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+	TIMER_DECLARE(2);
+	TIMER_BEGIN(2);
+	std::vector<std::string> results = search_index(query, DEDUP_INDEX_DIR);
+	TIMER_END(2, index_lookup_time);
+	TIMER_DECLARE(3);
+	TIMER_BEGIN(3);
+	init_pathstore();
+	std::set<std::string> found_in_files;
+	for (const auto& result : results) {
+		if (destor.is_textual_doc_id) {
+			found_in_files.insert(get_path(std::atoi(result.data())));
+		} else {
+			found_in_files.insert(get_path(*(uint32_t*)result.data()));
+		}
+	}
+	close_pathstore();
+	TIMER_END(3, indirection_time);
+	TIMER_END(1, total_lookup_time);
+	FILE* results_file = fopen("dedup_lookup_results.out", "wb");
+	for	(const std::string& result : results) {
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	}
+	results.clear();
+	fclose(results_file);
+
+	total_lookup_time /= 1000000;
+	index_lookup_time /= 1000000;
+	indirection_time /= 1000000;
+
+	printf("lookup time: %.3f\n", total_lookup_time);
+	printf("index lookup time: %.3f\n", index_lookup_time);
+	printf("indirection time: %.3f\n", indirection_time);
+	printf("Number of results: %d\n", found_in_files.size());
+}
+
 struct IndexLookup {
 	std::vector<std::string> keywords;
 	SyncQueue* queue;

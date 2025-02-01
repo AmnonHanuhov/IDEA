@@ -26,6 +26,7 @@ extern void do_naive_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 extern void do_deduplicated_index();
 extern void do_deduplicated_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 extern void do_deduplicated_lookup_threaded(unsigned char **keywords_p, size_t keywords_num_p, sds keywords_file);
+extern void do_deduplicated_lookup_using_parser(const std::string& query);
 
 extern int load_config();
 extern void load_config_from_string(sds config);
@@ -38,7 +39,7 @@ int job;
 /* : means argument is required.
  * :: means argument is optional.
  */
-const char * const short_options = "edyzsr:t:p:hlqnf:mabc";
+const char * const short_options = "edyzsr:t:p:hlkqnf:mabc";
 
 struct option long_options[] = {
 		{ "state", 0, NULL, 's' },
@@ -48,6 +49,7 @@ struct option long_options[] = {
 		{ "naive-lookup", 0, NULL, 'm'},
 		{ "dedup-index", 0, NULL, 'q'},
 		{ "dedup-lookup", 0, NULL, 'l'},
+		{ "dedup-parser-lookup", 0, NULL, 'k'},
 		{ "print-terms", 0, NULL, 'z'},
 		{ "print-terms-dedup", 0, NULL, 'y'},
 		{ "naive-load-time", 0, NULL, 'd'},
@@ -91,6 +93,9 @@ void usage() {
 	puts("\tDedup lookup");
 	puts("\t\tdestor -l keyword1 keyword2 ...");
 	puts("\t\tUse at end of command only!");
+
+	puts("\tDedup parser lookup");
+	puts("\t\tdestor -k <query>");
 
 	exit(0);
 }
@@ -438,6 +443,10 @@ int main(int argc, char **argv) {
 			job = DESTOR_NAIVE_LOOKUP;
 			break;
 		}
+		case 'k': {
+			job = DESTOR_DEDUPLICATED_QUERY_PARSER_LOOKUP;
+			break;
+		}
 		case 'l': {
 			job = DESTOR_DEDUPLICATED_LOOKUP;
 			break;
@@ -525,6 +534,12 @@ int main(int argc, char **argv) {
 		}
 		free(keywords);
 		sdsfree(path);
+		break;
+	}
+	case DESTOR_DEDUPLICATED_QUERY_PARSER_LOOKUP: {
+		// TODO: Extract query from command line or file
+		std::string query = argv[2];
+		do_deduplicated_lookup_using_parser(query);
 		break;
 	}
 	case DESTOR_NAIVE_INDEX:
