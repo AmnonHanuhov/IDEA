@@ -41,6 +41,7 @@ DocumentPtr create_multiple_names_document(const std::vector<std::wstring>& name
 std::vector<std::string> search_index(const std::string& query, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_query_in_index(const QueryPtr& query, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_keywords_in_index(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
+std::vector<std::string> search_keywords_in_index_and(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::map<std::string, std::vector<uint64_t>> search_keywords_in_index_with_tv_offsets(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::map<std::string, std::vector<uint64_t>> search_keywords_in_index_with_global_offsets(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::map<std::string, double> search_keywords_in_index_with_scores(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);

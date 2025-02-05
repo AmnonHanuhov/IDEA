@@ -294,6 +294,31 @@ std::vector<std::string> search_keywords_in_index(const std::vector<std::string>
 	return search_query_in_index(query, index, queue);
 }
 
+std::vector<std::string> search_keywords_in_index_and(const std::vector<std::string>& keywords, 
+												  const std::string& index, 
+												  SyncQueue* queue) {
+
+	double query_creation_time = 0;
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+
+	BooleanQuery::setMaxClauseCount(std::numeric_limits<int32_t>::max());
+
+	BooleanQueryPtr query = newLucene<BooleanQuery>();	
+
+	for (size_t i = 0; i < keywords.size(); i++) {
+		const String keyword = toWstring(keywords[i]);
+		query->add(newLucene<TermQuery>(newLucene<Term>(toWstring("data"), 
+														StringUtils::toLower(keyword))),
+				   BooleanClause::MUST);
+	}
+
+	TIMER_END(1, query_creation_time);
+	printf("query creation time: %.3f\n", query_creation_time / 1000000);
+	
+	return search_query_in_index(query, index, queue);
+}
+
 
 
 std::vector<std::string> search_query_in_index(const QueryPtr& query, const std::string& index, SyncQueue* queue) {

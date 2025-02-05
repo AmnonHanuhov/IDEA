@@ -347,6 +347,33 @@ void do_naive_lookup(unsigned char **keywords, size_t keywords_num) {
 	write_file(lookup_log_path, "naive,%d,%.3f,0,0,0,%llu,0,0,0,%.3f,%.3f,%.3f\n", keywords_num, lookup_time, results_size, searcher_load_time, dtor_time, lookup_time - dtor_time);
 }
 
+void do_naive_and_lookup(unsigned char **keywords, size_t keywords_num) {
+	double total_lookup_time = 0, keywords_load_time = 0;
+	destor_log(DESTOR_NOTICE, "naive lookup");
+	puts("==== naive AND lookup start ====");
+	TIMER_DECLARE(5);
+	TIMER_BEGIN(5);
+	std::vector<std::string> keywords_vec(keywords_num);
+	for (int i = 0; i < keywords_num; i++, optind++) {
+		keywords_vec[i] = (const char*)keywords[i];
+		std::cout << keywords_vec[i] << std::endl;
+	}
+	TIMER_END(5, keywords_load_time);
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+	std::vector<std::string> results(search_keywords_in_index_and(keywords_vec, NAIVE_INDEX_DIR));
+	TIMER_END(1, total_lookup_time);
+	printf("keywords load time: %.3f\n", keywords_load_time / 1000000);
+	FILE* results_file = fopen("lookup_results.out", "wb");
+	for	(const std::string& result : results) {
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	}
+	fclose(results_file);
+	total_lookup_time /= 1000000;
+	printf("lookup time: %.3f\n", total_lookup_time);
+	printf("Number of results: %d\n", results.size());
+}
+
 static void* read_container_thread(void *arg) {
 	containerid container_id;
 	containerid container_count = (containerid)get_container_count();
@@ -956,11 +983,16 @@ void do_deduplicated_lookup_using_parser(const std::string& query) {
 	/**
 	 * Assuming no offsets, no ranking, in-doc reverse mapping and indirect-path-strings
 	 */
+	destor_log(DESTOR_NOTICE, "dedup lookup using parser");
+
+	puts("==== deduplicated lookup using parser start ====");
 	double total_lookup_time = 0, index_lookup_time = 0, indirection_time = 0;
 	TIMER_DECLARE(1);
 	TIMER_BEGIN(1);
 	TIMER_DECLARE(2);
 	TIMER_BEGIN(2);
+	// potential duplicate results? should we then move this to a set like they do in the previous function?
+	// something to keep in mind.
 	std::vector<std::string> results = search_index(query, DEDUP_INDEX_DIR);
 	TIMER_END(2, index_lookup_time);
 	TIMER_DECLARE(3);
@@ -992,6 +1024,71 @@ void do_deduplicated_lookup_using_parser(const std::string& query) {
 	printf("index lookup time: %.3f\n", index_lookup_time);
 	printf("indirection time: %.3f\n", indirection_time);
 	printf("Number of results: %d\n", found_in_files.size());
+}
+
+void do_deduplicated_AND_lookup(unsigned char **keywords, size_t keywords_num) {
+
+	double total_lookup_time = 0, keywords_load_time = 0;
+	destor_log(DESTOR_NOTICE, "dedup AND lookup");
+	puts("==== deduplicated AND lookup start ====");
+	TIMER_DECLARE(5);
+	TIMER_BEGIN(5);
+	std::vector<std::string> keywords_vec(keywords_num);
+	for (int i = 0; i < keywords_num; i++, optind++) {
+		keywords_vec[i] = (const char*)keywords[i];
+	}
+	TIMER_END(5, keywords_load_time);
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+	// potential duplicate results? should we then move this to a set like they do in the previous function?
+	// something to keep in mind.
+	std::unordered_map<std::string, std::set<std::string>> results;
+	init_pathstore();
+	std::vector<std::string> chunks;
+	for (auto keyword : keywords_vec) {
+		chunks = search_index(keyword, DEDUP_INDEX_DIR);
+		std::set<std::string> found_in_files;
+		for (const auto& chunk : chunks) {
+			if (destor.is_textual_doc_id) {
+				found_in_files.insert(get_path(std::atoi(chunk.data())));
+			} else {
+				found_in_files.insert(get_path(*(uint32_t*)chunk.data()));
+			}
+		}
+		results.emplace(keyword, found_in_files);
+	}
+	close_pathstore();
+	std::set<std::string> results_set;
+    auto it = results.find(keywords_vec[0]);
+	if (it != results.end()) {
+        results_set = it->second;
+    }
+    // Intersect with the file lists of remaining keywords
+    for (size_t i = 1; i < keywords_vec.size(); ++i) {
+        auto it = results.find(keywords_vec[i]);
+        if (it == results.end()) {
+           break;  // One keyword not found means intersection is empty
+        }
+        std::set<std::string> tempSet;
+        std::set_intersection(
+            results_set.begin(), results_set.end(),
+            it->second.begin(), it->second.end(),
+            std::inserter(tempSet, tempSet.begin())
+        );
+        
+        results_set = std::move(tempSet);
+        if (results_set.empty()) break;  // Early exit if no common files
+    }
+	TIMER_END(1, total_lookup_time);
+	printf("keywords load time: %.3f\n", keywords_load_time / 1000000);
+	FILE* results_file = fopen("dedup_lookup_results.out", "wb");
+	for	(const std::string& result : results_set) {
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	}
+	fclose(results_file);
+	total_lookup_time /= 1000000;
+	printf("lookup time: %.3f\n", total_lookup_time);
+	printf("Number of results: %d\n", results_set.size());
 }
 
 struct IndexLookup {

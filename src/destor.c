@@ -23,10 +23,12 @@ void do_delete(int jobid);
 extern void make_trace(char *raw_files);
 extern void do_naive_index();
 extern void do_naive_lookup(unsigned char **keywords_p, size_t keywords_num_p);
+extern void do_naive_and_lookup(unsigned char **keywords, size_t keywords_num);
 extern void do_deduplicated_index();
 extern void do_deduplicated_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 extern void do_deduplicated_lookup_threaded(unsigned char **keywords_p, size_t keywords_num_p, sds keywords_file);
 extern void do_deduplicated_lookup_using_parser(const std::string& query);
+extern void do_deduplicated_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 
 extern int load_config();
 extern void load_config_from_string(sds config);
@@ -39,7 +41,7 @@ int job;
 /* : means argument is required.
  * :: means argument is optional.
  */
-const char * const short_options = "edyzsr:t:p:hlkqnf:mabc";
+const char * const short_options = "edyzsr:t:p:hlkvqnf:mgabc";
 
 struct option long_options[] = {
 		{ "state", 0, NULL, 's' },
@@ -47,9 +49,11 @@ struct option long_options[] = {
 		/// all the options below are for IDEA.
 		{ "naive-index", 0, NULL, 'n'},
 		{ "naive-lookup", 0, NULL, 'm'},
+		{ "naive-parser-and-lookup", 0, NULL, 'g'},
 		{ "dedup-index", 0, NULL, 'q'},
 		{ "dedup-lookup", 0, NULL, 'l'},
 		{ "dedup-parser-lookup", 0, NULL, 'k'},
+		{ "dedup-parser-and-lookup", 0, NULL, 'v'},
 		{ "print-terms", 0, NULL, 'z'},
 		{ "print-terms-dedup", 0, NULL, 'y'},
 		{ "naive-load-time", 0, NULL, 'd'},
@@ -96,6 +100,14 @@ void usage() {
 
 	puts("\tDedup parser lookup");
 	puts("\t\tdestor -k <query>");
+
+	puts("\tDedup AND lookup");
+	puts("\t\tdestor -v keyword1 keyword2 ...");
+	puts("\t\tUse at end of command only!");
+
+	puts("\tnaive AND lookup");
+	puts("\t\tdestor -g keyword1 keyword2 ...");
+	puts("\t\tUse at end of command only!");
 
 	exit(0);
 }
@@ -163,6 +175,8 @@ char** get_keywords(sds keywords_file, size_t* keywords_num, size_t keyword_leng
 		fprintf(stderr, "Keywords are required!\n");
 		usage();
 	}
+	// temp fix until I figure out why the last keyword is duplicated
+	*keywords_num = *keywords_num-1;
 	return keywords;
 }
 
@@ -443,8 +457,16 @@ int main(int argc, char **argv) {
 			job = DESTOR_NAIVE_LOOKUP;
 			break;
 		}
+		case 'g': {
+			job = DESTOR_NAIVE_AND_LOOKUP;
+			break;
+		}
 		case 'k': {
 			job = DESTOR_DEDUPLICATED_QUERY_PARSER_LOOKUP;
+			break;
+		}
+		case 'v': {
+			job = DESTOR_DEDUPLICATED_AND_LOOKUP;
 			break;
 		}
 		case 'l': {
@@ -520,6 +542,16 @@ int main(int argc, char **argv) {
 		sdsfree(path);
 		break;
 	}
+	case DESTOR_NAIVE_AND_LOOKUP: {
+		keywords = get_keywords(keywords_file, &keywords_num, keywords_length, argc, argv);
+		do_naive_and_lookup(keywords, keywords_num);
+		for (int i = 0; i < keywords_num; i++, optind++){
+			sdsfree(keywords[i]);
+		}
+		free(keywords);
+		sdsfree(path);
+		break;
+	}
 	case DESTOR_DEDUPLICATED_LOOKUP: {
 		keywords = get_keywords(keywords_file, &keywords_num, keywords_length, argc, argv);
 		
@@ -540,6 +572,16 @@ int main(int argc, char **argv) {
 		// TODO: Extract query from command line or file
 		std::string query = argv[2];
 		do_deduplicated_lookup_using_parser(query);
+		break;
+	}
+	case DESTOR_DEDUPLICATED_AND_LOOKUP: {
+		keywords = get_keywords(keywords_file, &keywords_num, keywords_length, argc, argv);
+		do_deduplicated_AND_lookup(keywords, keywords_num);
+		for (int i = 0; i < keywords_num; i++, optind++){
+			sdsfree(keywords[i]);
+		}
+		free(keywords);
+		sdsfree(path);
 		break;
 	}
 	case DESTOR_NAIVE_INDEX:
