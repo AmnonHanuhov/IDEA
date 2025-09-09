@@ -29,6 +29,8 @@ extern void do_deduplicated_lookup(unsigned char **keywords_p, size_t keywords_n
 extern void do_deduplicated_lookup_threaded(unsigned char **keywords_p, size_t keywords_num_p, sds keywords_file);
 extern void do_deduplicated_lookup_using_parser(const std::string& query);
 extern void do_deduplicated_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
+extern void do_deduplicated_Batched_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
+extern void do_deduplicated_incremental_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 
 extern int load_config();
 extern void load_config_from_string(sds config);
@@ -576,7 +578,7 @@ int main(int argc, char **argv) {
 	}
 	case DESTOR_DEDUPLICATED_AND_LOOKUP: {
 		keywords = get_keywords(keywords_file, &keywords_num, keywords_length, argc, argv);
-		do_deduplicated_AND_lookup(keywords, keywords_num);
+		do_deduplicated_Batched_AND_lookup(keywords, keywords_num);
 		for (int i = 0; i < keywords_num; i++, optind++){
 			sdsfree(keywords[i]);
 		}

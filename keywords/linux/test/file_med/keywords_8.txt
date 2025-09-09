@@ -1,0 +1,8 @@
+backup
+0xe0000000
+mike
+smb
+boost
+190
+terminator
+bf

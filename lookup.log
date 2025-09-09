@@ -1,0 +1,6 @@
+index_type,keywords_num,total_lookup_time,index_lookup_time,reverse_lookup_time,chunk_found,results,external_reverse_mapping_load_time, reverse_mapping_get_files_time,indirection_time,searcher_load_time,dtor_time,lookup_no_dtor
+dedup,8,7.548,7.525,0.001,2409,2409,0.000,0.000,0.022,0.051,0.173,7.375
+naive,8,8.925,0,0,0,2915811,0,0,0,0.089,0.028,8.898
+dedup,8,13.249,5.118,3.400,5936811,2915811,0.000,0.000,3.774,0.039,0.012,13.237
+dedup,3,0.107,0.091,0.000,373,279,0.000,0.000,0.015,0.056,0.018,0.089
+naive,3,0.162,0,0,0,279,0,0,0,0.085,0.041,0.122

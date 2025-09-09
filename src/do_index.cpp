@@ -356,7 +356,6 @@ void do_naive_and_lookup(unsigned char **keywords, size_t keywords_num) {
 	std::vector<std::string> keywords_vec(keywords_num);
 	for (int i = 0; i < keywords_num; i++, optind++) {
 		keywords_vec[i] = (const char*)keywords[i];
-		std::cout << keywords_vec[i] << std::endl;
 	}
 	TIMER_END(5, keywords_load_time);
 	TIMER_DECLARE(1);
@@ -1028,67 +1027,198 @@ void do_deduplicated_lookup_using_parser(const std::string& query) {
 
 void do_deduplicated_AND_lookup(unsigned char **keywords, size_t keywords_num) {
 
-	double total_lookup_time = 0, keywords_load_time = 0;
+	double total_lookup_time = 0, keyword_to_file_id_time = 0, set_intersection_time = 0, file_id_to_path_time = 0;
 	destor_log(DESTOR_NOTICE, "dedup AND lookup");
 	puts("==== deduplicated AND lookup start ====");
-	TIMER_DECLARE(5);
-	TIMER_BEGIN(5);
 	std::vector<std::string> keywords_vec(keywords_num);
 	for (int i = 0; i < keywords_num; i++, optind++) {
 		keywords_vec[i] = (const char*)keywords[i];
 	}
-	TIMER_END(5, keywords_load_time);
 	TIMER_DECLARE(1);
 	TIMER_BEGIN(1);
 	// potential duplicate results? should we then move this to a set like they do in the previous function?
 	// something to keep in mind.
-	std::unordered_map<std::string, std::set<std::string>> results;
-	init_pathstore();
-	std::vector<std::string> chunks;
+
+	// Lookup: Start
+	TIMER_DECLARE(2);
+	TIMER_BEGIN(2);
+	std::vector<std::vector<std::string>> keyword_id_to_file_ids; // We can do the intersection on this basically have it as a set of strings and when we get a new vector do the intersection inline
+	std::vector<std::string> file_ids;
 	for (auto keyword : keywords_vec) {
-		chunks = search_index(keyword, DEDUP_INDEX_DIR);
-		std::set<std::string> found_in_files;
-		for (const auto& chunk : chunks) {
-			if (destor.is_textual_doc_id) {
-				found_in_files.insert(get_path(std::atoi(chunk.data())));
-			} else {
-				found_in_files.insert(get_path(*(uint32_t*)chunk.data()));
-			}
+		file_ids = search_index(keyword, DEDUP_INDEX_DIR);
+		keyword_id_to_file_ids.push_back(file_ids);
+	}
+	TIMER_END(2, keyword_to_file_id_time);
+	// Lookup: End
+
+	// Set Intersection: Start
+	TIMER_DECLARE(3);
+	TIMER_BEGIN(3);
+    std::set<std::string> resultSet(keyword_id_to_file_ids[0].begin(), keyword_id_to_file_ids[0].end());
+    for (size_t i = 1; i < keyword_id_to_file_ids.size(); ++i) {
+        std::vector<std::string> tempVec;
+        std::vector<std::string> sortedFiles = keyword_id_to_file_ids[i];
+
+        std::sort(sortedFiles.begin(), sortedFiles.end()); // Ensure correct set_intersection
+
+        std::set_intersection(
+            resultSet.begin(), resultSet.end(),
+            sortedFiles.begin(), sortedFiles.end(),
+            std::back_inserter(tempVec)
+        );
+
+        resultSet = std::set<std::string>(tempVec.begin(), tempVec.end());
+
+        if (resultSet.empty()) break; // Early exit if no common files remain
+    }
+	TIMER_END(3, set_intersection_time);
+	// Set Intersection: End
+
+	// Get File Path: Start
+	TIMER_DECLARE(4);
+	TIMER_BEGIN(4);
+	init_pathstore();
+	std::set<std::string> found_in_files;
+	for (const auto& file_id : resultSet) {
+		if (destor.is_textual_doc_id) {
+			found_in_files.insert(get_path(std::atoi(file_id.data())));
+		} else {
+			found_in_files.insert(get_path(*(uint32_t*)file_id.data()));
 		}
-		results.emplace(keyword, found_in_files);
 	}
 	close_pathstore();
-	std::set<std::string> results_set;
-    auto it = results.find(keywords_vec[0]);
-	if (it != results.end()) {
-        results_set = it->second;
-    }
-    // Intersect with the file lists of remaining keywords
-    for (size_t i = 1; i < keywords_vec.size(); ++i) {
-        auto it = results.find(keywords_vec[i]);
-        if (it == results.end()) {
-           break;  // One keyword not found means intersection is empty
-        }
-        std::set<std::string> tempSet;
-        std::set_intersection(
-            results_set.begin(), results_set.end(),
-            it->second.begin(), it->second.end(),
-            std::inserter(tempSet, tempSet.begin())
-        );
-        
-        results_set = std::move(tempSet);
-        if (results_set.empty()) break;  // Early exit if no common files
-    }
+	TIMER_END(4, file_id_to_path_time);
+	// Get File Path: End
+	
 	TIMER_END(1, total_lookup_time);
-	printf("keywords load time: %.3f\n", keywords_load_time / 1000000);
 	FILE* results_file = fopen("dedup_lookup_results.out", "wb");
-	for	(const std::string& result : results_set) {
+	for	(const std::string& result : found_in_files) {
 		fprintf(results_file, "found result: %s\n", result.c_str());
 	}
 	fclose(results_file);
-	total_lookup_time /= 1000000;
-	printf("lookup time: %.3f\n", total_lookup_time);
-	printf("Number of results: %d\n", results_set.size());
+	printf("total lookup time: %.3f\n", total_lookup_time / 1000000);
+	printf("keyword to file id lookup time: %.3f\n", keyword_to_file_id_time / 1000000);
+	printf("set intersection time: %.3f\n", set_intersection_time / 1000000);
+	printf("file id to path time: %.3f\n", file_id_to_path_time / 1000000);
+	printf("Number of results: %d\n", found_in_files.size());
+}
+
+void do_deduplicated_Batched_AND_lookup(unsigned char **keywords, size_t keywords_num) {
+
+	double total_lookup_time = 0, keyword_to_file_id_time = 0, set_intersection_time = 0, file_id_to_path_time = 0;
+	destor_log(DESTOR_NOTICE, "dedup Batched AND lookup");
+	puts("==== deduplicated Batched AND lookup start ====");
+	std::vector<std::string> keywords_vec(keywords_num);
+	for (int i = 0; i < keywords_num; i++, optind++) {
+		keywords_vec[i] = (const char*)keywords[i];
+	}
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+	// potential duplicate results? should we then move this to a set like they do in the previous function?
+	// something to keep in mind.
+
+	// Lookup: Start
+	TIMER_DECLARE(2);
+	TIMER_BEGIN(2);
+	std::vector<std::vector<std::string>> keyword_id_to_file_ids;
+	std::vector<std::string> file_ids = search_keywords_in_index_batched_and2(keywords_vec, DEDUP_INDEX_DIR);
+	TIMER_END(2, keyword_to_file_id_time);
+	// Lookup: End
+
+	// Get File Path: Start
+	TIMER_DECLARE(4);
+	TIMER_BEGIN(4);
+	init_pathstore();
+	std::set<std::string> found_in_files;
+	for (const auto& file_id : file_ids) {
+		if (destor.is_textual_doc_id) {
+			found_in_files.insert(get_path(std::atoi(file_id.data())));
+		} else {
+			found_in_files.insert(get_path(*(uint32_t*)file_id.data()));
+		}
+	}
+	close_pathstore();
+	TIMER_END(4, file_id_to_path_time);
+	// Get File Path: End
+	
+	TIMER_END(1, total_lookup_time);
+	FILE* results_file = fopen("dedup_lookup_results.out", "wb");
+	for	(const std::string& result : found_in_files) {
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	}
+	fclose(results_file);
+	printf("total lookup time: %.3f\n", total_lookup_time / 1000000);
+	printf("keyword to file id lookup time: %.3f\n", keyword_to_file_id_time / 1000000);
+	// printf("set intersection time: %.3f\n", set_intersection_time / 1000000);
+	printf("file id to path time: %.3f\n", file_id_to_path_time / 1000000);
+	printf("Number of results: %d\n", found_in_files.size());
+}
+
+void do_deduplicated_incremental_AND_lookup(unsigned char **keywords, size_t keywords_num) {
+
+	double total_lookup_time = 0, keyword_to_file_id_time = 0, set_intersection_time = 0, file_id_to_path_time = 0;
+	destor_log(DESTOR_NOTICE, "dedup Incremental AND lookup");
+	puts("==== deduplicated Incremental AND lookup start ====");
+	std::vector<std::string> keywords_vec(keywords_num);
+	for (int i = 0; i < keywords_num; i++, optind++) {
+		keywords_vec[i] = (const char*)keywords[i];
+	}
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+	// potential duplicate results? should we then move this to a set like they do in the previous function?
+	// something to keep in mind.
+
+	// Lookup: Start
+	TIMER_DECLARE(2);
+	TIMER_BEGIN(2);
+	std::vector<std::vector<std::string>> keyword_id_to_file_ids;
+	std::vector<std::string> file_ids;
+	file_ids = search_index(keywords_vec[0], DEDUP_INDEX_DIR);
+	std::set<std::string> resultSet(file_ids.begin(), file_ids.end());
+	for (size_t i = 1; i < keywords_num; i++) {
+		file_ids = search_index(keywords_vec[i], DEDUP_INDEX_DIR);
+		std::vector<std::string> tempVec;
+        std::vector<std::string> sortedFiles = file_ids;
+		std::sort(sortedFiles.begin(), sortedFiles.end()); // Ensure correct set_intersection
+		std::set_intersection(
+            resultSet.begin(), resultSet.end(),
+            sortedFiles.begin(), sortedFiles.end(),
+            std::back_inserter(tempVec)
+        );
+		resultSet = std::set<std::string>(tempVec.begin(), tempVec.end());
+
+        if (resultSet.empty()) return {}; // Early exit if no common files remain
+	}
+	TIMER_END(2, keyword_to_file_id_time);
+	// Lookup: End
+
+	// Get File Path: Start
+	TIMER_DECLARE(4);
+	TIMER_BEGIN(4);
+	init_pathstore();
+	std::set<std::string> found_in_files;
+	for (const auto& file_id : resultSet) {
+		if (destor.is_textual_doc_id) {
+			found_in_files.insert(get_path(std::atoi(file_id.data())));
+		} else {
+			found_in_files.insert(get_path(*(uint32_t*)file_id.data()));
+		}
+	}
+	close_pathstore();
+	TIMER_END(4, file_id_to_path_time);
+	// Get File Path: End
+	
+	TIMER_END(1, total_lookup_time);
+	FILE* results_file = fopen("dedup_lookup_results.out", "wb");
+	for	(const std::string& result : found_in_files) {
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	}
+	fclose(results_file);
+	printf("total lookup time: %.3f\n", total_lookup_time / 1000000);
+	printf("keyword to file id lookup time: %.3f\n", keyword_to_file_id_time / 1000000);
+	printf("set intersection time: %.3f\n", set_intersection_time / 1000000);
+	printf("file id to path time: %.3f\n", file_id_to_path_time / 1000000);
+	printf("Number of results: %d\n", found_in_files.size());
 }
 
 struct IndexLookup {
