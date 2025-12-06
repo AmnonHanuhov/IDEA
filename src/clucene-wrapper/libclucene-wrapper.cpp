@@ -15,6 +15,7 @@
 #include <chrono>
 #include <fstream>
 #include <string>
+#include <array>
 #include <vector>
 #include <limits>
 #include <unordered_map>
@@ -273,6 +274,101 @@ public:
 		return results;
 	}
 
+	// Cache: chunkID -> vector<int32_t> fileIds
+	using ChunkToFilesMap = std::unordered_map<int32_t, std::vector<int32_t>>;
+	struct SegmentedFileCounts {
+		static const uint32_t SEG_SHIFT = 12;                  // segment = 4096 entries
+		static const uint32_t SEG_SIZE  = 1u << SEG_SHIFT;
+		static const uint32_t SEG_MASK  = SEG_SIZE - 1;
+		uint16_t num_resizes;
+
+		// segments[i] points to an array<uint16_t, SEG_SIZE> (heap-allocated)
+		std::vector<uint16_t*> segments;  // nullptr means "no segment yet"
+
+		~SegmentedFileCounts() {
+			for (auto* seg : segments) {
+				free(seg);
+			}
+		}
+
+		// First term: get or create
+		uint16_t& getOrCreate(int32_t fileId) {
+			uint32_t id = static_cast<uint32_t>(fileId);
+			uint32_t segIdx = id >> SEG_SHIFT;
+			uint32_t offset = id & SEG_MASK;
+
+			if (segIdx >= segments.size()) {
+				std::cout << "resized" << std::endl;
+				segments.resize(segIdx + 1, nullptr);
+			}
+			uint16_t*& seg = segments[segIdx];
+			if (!seg) {
+				// zero-initialized
+				seg = (uint16_t*)calloc(SEG_SIZE, sizeof(uint16_t));
+			}
+			return seg[offset];
+		}
+
+		// Later terms: only if exists
+		uint16_t* getIfExists(int32_t fileId) {
+			uint32_t id = static_cast<uint32_t>(fileId);
+			uint32_t segIdx = id >> SEG_SHIFT;
+			if (segIdx >= segments.size()) return nullptr;
+			uint16_t* seg = segments[segIdx];
+			if (!seg) return nullptr;
+			uint32_t offset = id & SEG_MASK;
+			return &seg[offset];
+		}
+
+		// Collect results: all fileIds with count == requiredCount
+		void collectResults(uint16_t requiredCount,
+							std::vector<std::string>& results) const {
+			for (uint32_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
+				uint16_t* seg = segments[segIdx];
+				if (!seg) continue;
+				uint32_t baseId = segIdx << SEG_SHIFT;
+				for (uint32_t offset = 0; offset < SEG_SIZE; ++offset) {
+					if (seg[offset] == requiredCount) {
+						int32_t fid = static_cast<int32_t>(baseId + offset);
+						results.push_back(std::to_string(fid));
+					}
+				}
+			}
+		}
+
+		// Rough memory usage estimate
+		size_t memoryUsageBytes() const {
+			size_t bytes = sizeof(segments) + segments.capacity() * sizeof(uint16_t*);
+			for (auto* seg : segments) {
+				if (seg) {
+					bytes += SEG_SIZE * sizeof(uint16_t);
+				}
+			}
+			return bytes;
+		}
+	};
+
+
+	// Size-estimation helpers
+	inline size_t estimateChunkToFilesBytes(const ChunkToFilesMap& chunkToFiles) {
+		size_t bytes =
+			sizeof(chunkToFiles) +
+			chunkToFiles.bucket_count() * sizeof(void*);
+
+		for (const auto& p : chunkToFiles) {
+			// key
+			bytes += sizeof(p.first); // int32_t chunkID
+
+			// value: std::vector<int32_t>
+			const auto& vec = p.second;
+			bytes += sizeof(vec) + vec.capacity() * sizeof(int32_t);
+
+			// approximate node overhead
+			bytes += sizeof(void*) * 2;
+		}
+		return bytes;
+	}
+
 	virtual std::vector<std::string> getResultsFromSearcherIncrementalIntersectionDynamic(
     IndexSearcherPtr searcher,
     std::vector<std::vector<int32_t>>* matchTracker)
@@ -283,12 +379,13 @@ public:
 		double total_sorting_keywords_time   = 0;
 		double total_intersection_time       = 0;
 		double total_fetch_files_time        = 0;
+
 		std::vector<std::string> results;
 		bool no_common_files = false;
 		uint32_t num_files_fetched  = 0;
 		uint32_t num_chunks_fetched = 0;
 
-		// Size accounting if you still want it
+		// --- matchTracker size accounting ---
 		size_t matchTracker_total_bytes = sizeof(*matchTracker);
 		matchTracker_total_bytes += matchTracker->capacity() * sizeof(std::vector<int32_t>);
 		for (const auto& inner : *matchTracker) {
@@ -310,24 +407,13 @@ public:
 
 		static const std::wstring nameField = toWstring("name");
 
-		// Cache: chunkID -> vector<int32_t> fileIds
-		std::unordered_map<int32_t, std::vector<int32_t> > chunkToFiles;
+		// --- Caches / state ---
+		ChunkToFilesMap    chunkToFiles;   // chunkID -> vector<int32_t> fileIds
+		SegmentedFileCounts fileState;     // fileId  -> seenCount (via buckets)
 
-		// Per-file state: in how many terms this file has been seen (in order)
-		// We'll size this lazily as we discover file IDs
-		std::vector<uint16_t> seenCountByFile;
-
-		// Helper: ensure seenCountByFile can index fileId
-		auto ensure_file_capacity = [&](int32_t fileId) {
-			if (fileId < 0) return; // should not happen if IDs are nonnegative
-			if ((size_t)fileId >= seenCountByFile.size()) {
-				seenCountByFile.resize(fileId + 1, 0);
-			}
-		};
-
-		// Helper: fetch and cache file IDs for a chunk
+		// Helper: fetch and cache file IDs for a chunk (kept as lambda to keep timers local)
 		auto get_files_for_chunk = [&](int32_t chunkID) -> const std::vector<int32_t>& {
-			std::unordered_map<int32_t, std::vector<int32_t> >::iterator it = chunkToFiles.find(chunkID);
+			auto it = chunkToFiles.find(chunkID);
 			if (it != chunkToFiles.end()) {
 				return it->second; // cache hit, no timing
 			}
@@ -344,17 +430,12 @@ public:
 			for (size_t i = 0; i < fileIDs.size(); ++i) {
 				const std::wstring& w = fileIDs[i];
 				// Assuming "name" is a decimal textual ID, like "12345"
-				// You can optimize this parse if needed
-				// TODO: print some fileIDs to see what they look like
-				// TODO: how much space does this vector need?
 				int32_t fileId = std::stoi(w);
-				ensure_file_capacity(fileId);
 				files.push_back(fileId);
 			}
 			num_files_fetched += files.size();
 
-			std::pair<std::unordered_map<int32_t, std::vector<int32_t> >::iterator, bool> inserted =
-				chunkToFiles.insert(std::make_pair(chunkID, std::move(files)));
+			auto inserted = chunkToFiles.insert(std::make_pair(chunkID, std::move(files)));
 			return inserted.first->second;
 		};
 
@@ -368,35 +449,34 @@ public:
 
 		int32_t termsProcessed = 0;
 
-		// Process terms in sorted order
 		for (int32_t termIndex = 0; termIndex < numTerms; ++termIndex) {
 			int32_t termId = sorted_termIDs_by_matches[termIndex];
-
 			size_t advancedThisTerm = 0;
 
-			for (size_t idx = 0; idx < (*matchTracker)[termId].size(); ++idx) {
-				int32_t chunkID = (*matchTracker)[termId][idx];
+			const auto& chunksForTerm = (*matchTracker)[termId];
+
+			for (size_t idx = 0; idx < chunksForTerm.size(); ++idx) {
+				int32_t chunkID = chunksForTerm[idx];
 				const std::vector<int32_t>& files = get_files_for_chunk(chunkID);
 
 				if (termIndex == 0) {
-					// First term: mark all files as seen in term 1
 					for (size_t fi = 0; fi < files.size(); ++fi) {
 						int32_t fid = files[fi];
-						ensure_file_capacity(fid);
-						uint16_t& cnt = seenCountByFile[fid];
+						uint16_t& cnt = fileState.getOrCreate(fid);
 						if (cnt == 0) {
 							cnt = 1;
 						}
 					}
-				} else {
-					// Later terms: only advance files that were present in ALL previous terms
+				}
+				else {
 					for (size_t fi = 0; fi < files.size(); ++fi) {
 						int32_t fid = files[fi];
-						if ((size_t)fid >= seenCountByFile.size()) {
-							// This file never seen before; it cannot be in the intersection
+						uint16_t* cntPtr = fileState.getIfExists(fid);
+						if (!cntPtr) {
+							// never seen before; can't be in intersection
 							continue;
 						}
-						uint16_t& cnt = seenCountByFile[fid];
+						uint16_t& cnt = *cntPtr;
 						if (cnt == (uint16_t)termIndex) {
 							cnt = (uint16_t)(termIndex + 1);
 							++advancedThisTerm;
@@ -406,7 +486,6 @@ public:
 			}
 
 			if (termIndex > 0 && advancedThisTerm == 0) {
-				// No file advanced to "seen in all terms up to termIndex" → empty intersection
 				no_common_files = true;
 				termsProcessed = termIndex + 1;
 				break;
@@ -417,46 +496,39 @@ public:
 
 		TIMER_END(2, total_intersection_time);
 
+
 		// --- Build final results: files that survived all processed terms ---
 		if (!no_common_files && termsProcessed == numTerms) {
-			// Collect all fileIds with seenCount == numTerms
-			for (int32_t fid = 0; fid < (int32_t)seenCountByFile.size(); ++fid) {
-				if (seenCountByFile[fid] == (uint16_t)numTerms) {
-					results.push_back(std::to_string(fid));
-				}
+			fileState.collectResults((uint16_t)numTerms, results);
+		}
+
+		// --- Memory estimates for chunkToFiles & fileState ---
+		size_t chunkToFiles_bytes = estimateChunkToFilesBytes(chunkToFiles);
+		size_t fileState_bytes    = fileState.memoryUsageBytes();
+
+		size_t segmentsUsed = 0;
+		uint32_t maxSegIdx = 0;
+		for (uint32_t i = 0; i < fileState.segments.size(); ++i) {
+			if (fileState.segments[i]) {
+				++segmentsUsed;
+				maxSegIdx = i;
 			}
 		}
 
-		 // Estimate memory used by chunkToFiles
-		size_t chunkToFiles_bytes =
-			sizeof(chunkToFiles)
-			+ chunkToFiles.bucket_count() * sizeof(void*)
-			+ ([&]{
-				size_t sum = 0;
-				for (const auto& p : chunkToFiles) {
-					// key
-					sum += sizeof(p.first); // int32_t chunkID
-
-					// value: std::vector<int32_t>
-					const auto& vec = p.second;
-					sum += sizeof(vec) + vec.capacity() * sizeof(int32_t);
-
-					// approximate node overhead (next pointer + hash etc.)
-					sum += sizeof(void*) * 2;
-				}
-				return sum;
-			})();
-
-		std::cout << "chunkToFiles size: " << chunkToFiles_bytes << std::endl;
+		std::cout << "chunkToFiles size bytes: " << chunkToFiles_bytes
+				<< ", fileState size bytes: "  << fileState_bytes
+				<< ", segmentsUsed=" << segmentsUsed
+				<< ", segmentsCapacity=" << fileState.segments.capacity()
+				<< ", maxSegIdx=" << maxSegIdx
+				<< std::endl;
 
 		// Stats / logging
 		std::cout << "Number of chunks (m_docIds): " << m_docIds.size()
-				<< ", Unique chunks fetched: " << num_chunks_fetched
-				<< ", Total files fetched: " << num_files_fetched
+				<< ", Unique chunks fetched: "    << num_chunks_fetched
+				<< ", Total files fetched: "      << num_files_fetched
 				<< ", matchTracker size in bytes: " << matchTracker_total_bytes
-				<< ", seenCountByFile size: " << (sizeof(seenCountByFile) + seenCountByFile.capacity() * sizeof(uint16_t))
 				<< std::endl;
-
+		
 		printf("Sorting keywords by number of chunks time: %.3f\n",
 			total_sorting_keywords_time / 1000000.0);
 		printf("Performing intersection time: %.3f\n",
@@ -1029,6 +1101,23 @@ std::vector<std::string> search_query_in_index_tracking(const QueryPtr& query, c
 	return results;
 }
 
+struct IoStats {
+    long long read_bytes  = 0;
+    long long write_bytes = 0;
+};
+
+IoStats getIoStats() {
+    IoStats s;
+    std::ifstream f("/proc/self/io");
+    std::string key;
+    long long value;
+    while (f >> key >> value) {
+        if (key == "read_bytes:")  s.read_bytes = value;
+        if (key == "write_bytes:") s.write_bytes = value;
+    }
+    return s;
+}
+
 std::vector<std::string> search_query_in_index_tracking2(const QueryPtr& query, const std::string& index, std::vector<std::vector<int32_t>>* docBitmaps, SyncQueue* queue) {
 	MyHitCollectorPtr collector = newLucene<MyHitCollector>(queue);
 	double doc_id_lookup_time = 0, doc_fetch_lookup_time = 0;
@@ -1045,7 +1134,7 @@ std::vector<std::string> search_query_in_index_tracking2(const QueryPtr& query, 
 		TIMER_BEGIN(1);
 		searcher->search(query, nullptr, collector);
 		TIMER_END(1, doc_id_lookup_time);
-
+		IoStats before = getIoStats();
 		TIMER_BEGIN(2);
 		if (destor.is_threaded_lookup) { 
 			results = collector->m_results;
@@ -1055,6 +1144,10 @@ std::vector<std::string> search_query_in_index_tracking2(const QueryPtr& query, 
 			//results = collector->getResultsFromSearcherCachedIntersection(searcher, docBitmaps);
 		}
 		TIMER_END(2, doc_fetch_lookup_time);
+		IoStats after = getIoStats();
+		std::cout << "Query I/O: read_bytes = " << (after.read_bytes - before.read_bytes)
+          << ", write_bytes = " << (after.write_bytes - before.write_bytes)
+          << std::endl;
 		TIMER_BEGIN(4);
 	}
 	TIMER_END(4, dtor_time);
