@@ -41,9 +41,11 @@ DocumentPtr create_multiple_names_document(const std::vector<std::wstring>& name
 
 /// search in index
 std::vector<std::string> search_index(const std::string& query, const std::string& index, SyncQueue* queue = nullptr);
+std::vector<std::string> search_index_complex_query(const std::string& query, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_query_in_index(const QueryPtr& query, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_query_in_index_tracking(const QueryPtr& query, const std::string& index, std::unordered_map<int32_t, boost::dynamic_bitset<>>* docBitmaps, size_t num_keywords, SyncQueue* queue = nullptr);
 std::vector<std::string> search_query_in_index_tracking2(const QueryPtr& query, const std::string& index, std::vector<std::vector<int32_t>>* docBitmaps, SyncQueue* queue = nullptr);
+std::vector<std::string> search_query_in_index_not(const QueryPtr& query, std::vector<int32_t> included_terms, std::vector<int32_t> excluded_terms, const std::string& index, std::vector<std::vector<int32_t>>* docBitmaps, SyncQueue* queue = nullptr);
 std::vector<std::string> search_keywords_in_index(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_keywords_in_index_and(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_keywords_in_index_batched_and(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);

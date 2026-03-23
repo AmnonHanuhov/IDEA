@@ -28,6 +28,8 @@ extern void do_deduplicated_index();
 extern void do_deduplicated_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 extern void do_deduplicated_lookup_threaded(unsigned char **keywords_p, size_t keywords_num_p, sds keywords_file);
 extern void do_deduplicated_lookup_using_parser(const std::string& query);
+extern void do_naive_lookup_using_parser(const std::string& query);
+extern void do_deduplicated_NOT_lookup(const std::string& query);
 extern void do_deduplicated_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 extern void do_deduplicated_Batched_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 extern void do_deduplicated_incremental_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
@@ -43,12 +45,13 @@ int job;
 /* : means argument is required.
  * :: means argument is optional.
  */
-const char * const short_options = "edyzsr:t:p:hlkvqnf:mgabc";
+const char * const short_options = "edyzsr:t:p:hlikvqnf:mgabc";
 
 struct option long_options[] = {
 		{ "state", 0, NULL, 's' },
 		{ "help", 0, NULL, 'h' },
 		/// all the options below are for IDEA.
+		{ "dedup-parser-not lookup", 0, NULL, 'i'},
 		{ "naive-index", 0, NULL, 'n'},
 		{ "naive-lookup", 0, NULL, 'm'},
 		{ "naive-parser-and-lookup", 0, NULL, 'g'},
@@ -109,6 +112,10 @@ void usage() {
 
 	puts("\tnaive AND lookup");
 	puts("\t\tdestor -g keyword1 keyword2 ...");
+	puts("\t\tUse at end of command only!");
+
+	puts("\tDedup NOT lookup");
+	puts("\t\tdestor -i <query> ...");
 	puts("\t\tUse at end of command only!");
 
 	exit(0);
@@ -402,37 +409,40 @@ int main(int argc, char **argv) {
 		case 'b':
 			short_keywords = false;
 			break;
+		case 'c':
+			load_only("/home/asaf.levi/destor_index_directory/dedup_in_doc");
+			exit(0);
 		case 'd':
 			load_only("/home/asaf.levi/destor_index_directory/naive_index");
 			exit(0);
 		case 'e':
 			load_only("/home/asaf.levi/destor_index_directory/dedup_index");
 			exit(0);
-		case 'c':
-			load_only("/home/asaf.levi/destor_index_directory/dedup_in_doc");
-			exit(0);
-		case 'z':
-			print_terms(NAIVE_INDEX_DIR);
-			exit(0);
-		case 'y':
-			print_terms(DEDUP_INDEX_DIR);
-			exit(0);
-		case 'r':
-			job = DESTOR_RESTORE;
-			revision = atoi(optarg);
+		case 'f': {
+			keywords_file = sdsnew(optarg);
 			break;
-		case 's':
-			destor_stat();
+		}
+		case 'g': {
+			job = DESTOR_NAIVE_AND_LOOKUP;
 			break;
-		case 't':
-			job = DESTOR_MAKE_TRACE;
-			break;
+		}
 		case 'h':
 			usage();
 			break;
-		case 'p': {
-			sds param = sdsnew(optarg);
-			load_config_from_string(param);
+		case 'i': {
+			job = DESTOR_DEDUPLICATED_NOT_LOOKUP;
+			break;
+		}
+		case 'k': {
+			job = DESTOR_DEDUPLICATED_QUERY_PARSER_LOOKUP;
+			break;
+		}
+		case 'l': {
+			job = DESTOR_DEDUPLICATED_LOOKUP;
+			break;
+		}
+		case 'm': {
+			job = DESTOR_NAIVE_LOOKUP;
 			break;
 		}
 		case 'n': {
@@ -443,6 +453,11 @@ int main(int argc, char **argv) {
 			}
 			break;
 		}
+		case 'p': {
+			sds param = sdsnew(optarg);
+			load_config_from_string(param);
+			break;
+		}
 		case 'q': {
 			if (argc > 2) {
 				index_mode = INDEX_MODE_DEDUP;
@@ -451,30 +466,26 @@ int main(int argc, char **argv) {
 			}
 			break;
 		}
-		case 'f': {
-			keywords_file = sdsnew(optarg);
+		case 'r':
+			job = DESTOR_RESTORE;
+			revision = atoi(optarg);
 			break;
-		}
-		case 'm': {
-			job = DESTOR_NAIVE_LOOKUP;
+		case 's':
+			destor_stat();
 			break;
-		}
-		case 'g': {
-			job = DESTOR_NAIVE_AND_LOOKUP;
+		case 't':
+			job = DESTOR_MAKE_TRACE;
 			break;
-		}
-		case 'k': {
-			job = DESTOR_DEDUPLICATED_QUERY_PARSER_LOOKUP;
-			break;
-		}
 		case 'v': {
 			job = DESTOR_DEDUPLICATED_AND_LOOKUP;
 			break;
 		}
-		case 'l': {
-			job = DESTOR_DEDUPLICATED_LOOKUP;
-			break;
-		}
+		case 'y':
+			print_terms(DEDUP_INDEX_DIR);
+			exit(0);
+		case 'z':
+			print_terms(NAIVE_INDEX_DIR);
+			exit(0);
 		default:
 			printf("failed to find option %c, exiting\n", (char)opt);
 			return 1;
@@ -573,7 +584,8 @@ int main(int argc, char **argv) {
 	case DESTOR_DEDUPLICATED_QUERY_PARSER_LOOKUP: {
 		// TODO: Extract query from command line or file
 		std::string query = argv[2];
-		do_deduplicated_lookup_using_parser(query);
+		//do_deduplicated_lookup_using_parser(query);
+		do_naive_lookup_using_parser(query);
 		break;
 	}
 	case DESTOR_DEDUPLICATED_AND_LOOKUP: {
@@ -584,6 +596,11 @@ int main(int argc, char **argv) {
 		}
 		free(keywords);
 		sdsfree(path);
+		break;
+	}
+	case DESTOR_DEDUPLICATED_NOT_LOOKUP: {
+		std::string query = argv[2];
+		do_deduplicated_NOT_lookup(query);
 		break;
 	}
 	case DESTOR_NAIVE_INDEX:

@@ -373,6 +373,24 @@ void do_naive_and_lookup(unsigned char **keywords, size_t keywords_num) {
 	printf("Number of results: %d\n", results.size());
 }
 
+void do_naive_lookup_using_parser(const std::string& query) {
+	destor_log(DESTOR_NOTICE, "naive lookup");
+	puts("==== naive query lookup start ====");
+	double total_lookup_time = 0;
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+	std::vector<std::string> results(search_index(query, NAIVE_INDEX_DIR));
+	TIMER_END(1, total_lookup_time);
+	FILE* results_file = fopen("lookup_results.out", "wb");
+	for	(const std::string& result : results) {
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	}
+	fclose(results_file);
+	total_lookup_time /= 1000000;
+	printf("lookup time: %.3f\n", total_lookup_time);
+	printf("Number of results: %d\n", results.size());
+}
+
 static void* read_container_thread(void *arg) {
 	containerid container_id;
 	containerid container_count = (containerid)get_container_count();
@@ -1025,11 +1043,58 @@ void do_deduplicated_lookup_using_parser(const std::string& query) {
 	printf("Number of results: %d\n", found_in_files.size());
 }
 
+void do_deduplicated_NOT_lookup(const std::string& query) {
+	/**
+	 * Assuming no offsets, no ranking, in-doc reverse mapping and indirect-path-strings
+	 */
+	destor_log(DESTOR_NOTICE, "dedup NOT lookup using parser");
+
+	puts("==== deduplicated NOT lookup using parser start ====");
+	double total_lookup_time = 0, index_lookup_time = 0, indirection_time = 0;
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+	TIMER_DECLARE(2);
+	TIMER_BEGIN(2);
+	// potential duplicate results? should we then move this to a set like they do in the previous function?
+	// something to keep in mind.
+	std::vector<std::string> results = search_index_complex_query(query, DEDUP_INDEX_DIR);
+	TIMER_END(2, index_lookup_time);
+	TIMER_DECLARE(3);
+	TIMER_BEGIN(3);
+	init_pathstore();
+	std::set<std::string> found_in_files;
+	for (const auto& result : results) {
+		if (destor.is_textual_doc_id) {
+			found_in_files.insert(get_path(std::atoi(result.data())));
+		} else {
+			found_in_files.insert(get_path(*(uint32_t*)result.data()));
+		}
+	}
+	close_pathstore();
+	TIMER_END(3, indirection_time);
+	TIMER_END(1, total_lookup_time);
+	FILE* results_file = fopen("dedup_lookup_results.out", "wb");
+	for	(const std::string& result : results) {
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	}
+	results.clear();
+	fclose(results_file);
+
+	total_lookup_time /= 1000000;
+	index_lookup_time /= 1000000;
+	indirection_time /= 1000000;
+
+	printf("lookup time: %.3f\n", total_lookup_time);
+	printf("index lookup time: %.3f\n", index_lookup_time);
+	printf("indirection time: %.3f\n", indirection_time);
+	printf("Number of results: %d\n", found_in_files.size());
+}
+
 void do_deduplicated_AND_lookup(unsigned char **keywords, size_t keywords_num) {
 
 	double total_lookup_time = 0, keyword_to_file_id_time = 0, set_intersection_time = 0, file_id_to_path_time = 0;
-	destor_log(DESTOR_NOTICE, "dedup AND lookup");
-	puts("==== deduplicated AND lookup start ====");
+	destor_log(DESTOR_NOTICE, "dedup naive AND lookup");
+	puts("==== deduplicated naive AND lookup start ====");
 	std::vector<std::string> keywords_vec(keywords_num);
 	for (int i = 0; i < keywords_num; i++, optind++) {
 		keywords_vec[i] = (const char*)keywords[i];
