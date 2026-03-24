@@ -99,6 +99,10 @@
 #define TERM_VECTOR_OFFSETS 2
 #define GLOBAL_TERM_VECTOR_OFFSETS 3
 
+/* AND implementation for dedup lookups */
+#define AND_IMPL_INCREMENTAL              0  /* Count-Advancing Intersection with segmented vector (default) */
+#define AND_IMPL_BITMAP                   1  /* Per chunk bitmap of matching keywords */
+
 
 #define CHECK_FLAG(var, flag) ((var & flag) != 0)
 
@@ -351,6 +355,9 @@ struct destor {
 
 	/* whether to index and emit tf-idf */
 	bool tf_idf;
+
+	/* which AND algorithm to use for dedup lookups (AND_IMPL_*) */
+	uint32_t and_impl;
 
 }; // DedupSearch
 

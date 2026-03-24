@@ -31,8 +31,6 @@ extern void do_deduplicated_lookup_using_parser(const std::string& query);
 extern void do_naive_lookup_using_parser(const std::string& query);
 extern void do_deduplicated_NOT_lookup(const std::string& query);
 extern void do_deduplicated_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
-extern void do_deduplicated_Batched_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
-extern void do_deduplicated_incremental_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 
 extern int load_config();
 extern void load_config_from_string(sds config);
@@ -47,18 +45,20 @@ int job;
  */
 const char * const short_options = "edyzsr:t:p:hlikvqnf:mgabc";
 
+#define OPT_AND_IMPL 1001
+
 struct option long_options[] = {
 		{ "state", 0, NULL, 's' },
 		{ "help", 0, NULL, 'h' },
 		/// all the options below are for IDEA.
-		{ "dedup-parser-not lookup", 0, NULL, 'i'},
+		{ "dedup-parser-not-lookup", 0, NULL, 'i'},
 		{ "naive-index", 0, NULL, 'n'},
 		{ "naive-lookup", 0, NULL, 'm'},
 		{ "naive-parser-and-lookup", 0, NULL, 'g'},
 		{ "dedup-index", 0, NULL, 'q'},
 		{ "dedup-lookup", 0, NULL, 'l'},
 		{ "dedup-parser-lookup", 0, NULL, 'k'},
-		{ "dedup-parser-and-lookup", 0, NULL, 'v'},
+		{ "dedup-and-lookup", 0, NULL, 'v'},
 		{ "print-terms", 0, NULL, 'z'},
 		{ "print-terms-dedup", 0, NULL, 'y'},
 		{ "naive-load-time", 0, NULL, 'd'},
@@ -66,6 +66,7 @@ struct option long_options[] = {
 		{ "in-doc-load-time", 0, NULL, 'c'},
 		{ "reindex", 0, NULL, 'a'},
 		{ "no-short-keywords", 0, NULL, 'b'},
+		{ "and-impl", required_argument, NULL, OPT_AND_IMPL },
 		{ NULL, 0, NULL, 0 }
 };
 
@@ -252,6 +253,7 @@ void destor_start() {
 	destor.is_textual_doc_id = true;
 	destor.offsets_mode = NO_OFFSETS;
 	destor.tf_idf = 0;
+	destor.and_impl = AND_IMPL_INCREMENTAL;
 
 	load_config();
 
@@ -486,6 +488,15 @@ int main(int argc, char **argv) {
 		case 'z':
 			print_terms(NAIVE_INDEX_DIR);
 			exit(0);
+		case OPT_AND_IMPL: {
+			if      (strcmp(optarg, "inc") == 0) destor.and_impl = AND_IMPL_INCREMENTAL;
+			else if (strcmp(optarg, "bitmap")  == 0) destor.and_impl = AND_IMPL_BITMAP;
+			else {
+				fprintf(stderr, "Unknown --and-impl value: '%s'. Valid options: inc, bitmap\n", optarg);
+				exit(1);
+			}
+			break;
+		}
 		default:
 			printf("failed to find option %c, exiting\n", (char)opt);
 			return 1;
@@ -590,7 +601,7 @@ int main(int argc, char **argv) {
 	}
 	case DESTOR_DEDUPLICATED_AND_LOOKUP: {
 		keywords = get_keywords(keywords_file, &keywords_num, keywords_length, argc, argv);
-		do_deduplicated_Batched_AND_lookup(keywords, keywords_num);
+		do_deduplicated_AND_lookup(keywords, keywords_num);
 		for (int i = 0; i < keywords_num; i++, optind++){
 			sdsfree(keywords[i]);
 		}

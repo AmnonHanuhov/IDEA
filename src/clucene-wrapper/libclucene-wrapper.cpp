@@ -123,7 +123,7 @@ public:
 		return results;
 	}
 
-	virtual std::vector<std::string> getResultsFromSearcherWithTracking(
+	virtual std::vector<std::string> getResultsFromSearcherWithTrackingBitmap(
 		IndexSearcherPtr searcher,
 		std::unordered_map<int32_t, boost::dynamic_bitset<>>* docBitmaps,
 		size_t num_keywords) {
@@ -190,89 +190,6 @@ public:
 		printf("fetch files time: %.3f\n", total_docs_fetch_files_time / 1000000);
 		printf("file marking time: %.3f\n", total_docs_file_marking_time / 1000000);
 		printf("file coverage check time: %.3f\n", file_coverage_check_time / 1000000);
-
-		return results;
-	}
-
-	virtual std::vector<std::string> getResultsFromSearcherWithTracking2(
-		IndexSearcherPtr searcher,
-		std::vector<std::vector<int32_t>>* docBitmaps) {
-
-		TIMER_DECLARE(1);
-		TIMER_DECLARE(2);
-		TIMER_DECLARE(3);
-		double total_sorting_keywords_time = 0, total_intersection_time = 0, total_fetch_files_time = 0;
-		std::vector<std::string> results;
-		bool no_common_files = false;
-		uint32_t num_files_fetched = 0;
-
-		// Heuristic: Sort the keywords by the size of their vector (number of chunks), because it might indicate in how many files they appear
-		// then do the intersection in pairs, starting from the keywords with the least amount of chunks
-		// leading to a possible early exit if they don't have any files in common
-
-		// Sorting
-		TIMER_BEGIN(1);
-		std::vector<int32_t> sorted_termIDs_by_matches(docBitmaps->size());
-		for (int32_t i = 0; i < docBitmaps->size(); ++i) {
-			sorted_termIDs_by_matches[i] = i;
-		}
-		std::sort(sorted_termIDs_by_matches.begin(), sorted_termIDs_by_matches.end(), [docBitmaps](int32_t term1, int32_t term2) {
-			return (*docBitmaps)[term1].size() < (*docBitmaps)[term2].size();
-		});
-		TIMER_END(1, total_sorting_keywords_time);
-
-		TIMER_BEGIN(2);
-		// Create a hash map with the chunkIDs that match the first term in the sorted vector
-		static const std::wstring nameField = toWstring("name");
-		std::unordered_set<std::string> result;
-		for (int32_t chunkID : (*docBitmaps)[sorted_termIDs_by_matches[0]]) {
-			TIMER_BEGIN(3);
-			DocumentPtr document = searcher->doc(chunkID);
-			const auto& fileIDs = document->getValues(nameField);
-			TIMER_END(3, total_fetch_files_time);
-			for (const auto& fileID : fileIDs) {
-				std::string utf8Filename = StringUtils::toUTF8(fileID);
-				result.insert(utf8Filename);
-			}
-    	}
-		num_files_fetched = result.size();
-		// Perform intersection
-		for(int32_t index = 1; index < sorted_termIDs_by_matches.size(); index++) {
-			std::unordered_set<std::string> intersection;
-			int32_t current_term = sorted_termIDs_by_matches[index];
-			for (int32_t chunkID : (*docBitmaps)[current_term]) {
-				TIMER_BEGIN(3);
-				DocumentPtr document = searcher->doc(chunkID);
-				const auto& fileIDs = document->getValues(nameField);
-				TIMER_END(3, total_fetch_files_time);
-				num_files_fetched += fileIDs.size();
-				for (String fileID : fileIDs) {
-					std::string utf8Filename = StringUtils::toUTF8(fileID);
-					if (result.find(utf8Filename) != result.end()) {
-                	    intersection.insert(utf8Filename);
-                	}
-				}
-			}
-			if (intersection.empty()) { // no common files, break
-				no_common_files = true;
-				break;
-			}
-
-			// Found some common files, now the base should be the intersection
-			result = intersection;
-		}
-		TIMER_END(2, total_intersection_time);
-
-		if (!no_common_files) { // meaning there are common files
-			for (auto& fileID : result) {
-				results.push_back(fileID);
-			}
-		}
-
-		std::cout << "Number of chunks: " << m_docIds.size() << ", Number of files fetched: " << num_files_fetched << std::endl;
-		printf("Sorting keywords by number of chunks time: %.3f\n", total_sorting_keywords_time / 1000000);
-		printf("Performing intersection time: %.3f\n", total_intersection_time / 1000000);
-		printf("fetch files time: %.3f\n", total_fetch_files_time / 1000000);
 
 		return results;
 	}
@@ -364,7 +281,6 @@ public:
 		}
 	};
 
-
 	// Size-estimation helpers
 	inline size_t estimateChunkToFilesBytes(const ChunkToFilesMap& chunkToFiles) {
 		size_t bytes =
@@ -385,177 +301,16 @@ public:
 		return bytes;
 	}
 
-	virtual std::vector<std::string> getResultsFromSearcherIncrementalIntersectionDynamic(
-    IndexSearcherPtr searcher,
-    std::vector<std::vector<int32_t>>* matchTracker)
+	virtual std::vector<std::string> getResultsFromSearcherWithTrackingVector(
+		IndexSearcherPtr searcher,
+		std::vector<std::vector<int32_t>>* matchTracker)
 	{
-		TIMER_DECLARE(1);
-		TIMER_DECLARE(2);
-		TIMER_DECLARE(3);
-		double total_sorting_keywords_time   = 0;
-		double total_intersection_time       = 0;
-		double total_fetch_files_time        = 0;
-
-		std::vector<std::string> results;
-		bool no_common_files = false;
-		uint32_t num_files_fetched  = 0;
-		uint32_t num_chunks_fetched = 0;
-
-		// --- matchTracker size accounting ---
-		size_t matchTracker_total_bytes = sizeof(*matchTracker);
-		matchTracker_total_bytes += matchTracker->capacity() * sizeof(std::vector<int32_t>);
-		for (const auto& inner : *matchTracker) {
-			matchTracker_total_bytes += inner.capacity() * sizeof(int32_t);
-		}
-
-		// --- Sort terms by #chunks ---
-		TIMER_BEGIN(1);
-		std::vector<int32_t> sorted_termIDs_by_matches(matchTracker->size());
-		for (int32_t i = 0; i < (int32_t)matchTracker->size(); ++i) {
-			sorted_termIDs_by_matches[i] = i;
-		}
-		std::sort(sorted_termIDs_by_matches.begin(),
-				sorted_termIDs_by_matches.end(),
-				[matchTracker](int32_t t1, int32_t t2) {
-					return (*matchTracker)[t1].size() < (*matchTracker)[t2].size();
-				});
-		TIMER_END(1, total_sorting_keywords_time);
-
-		static const std::wstring nameField = toWstring("name");
-
-		// --- Caches / state ---
-		ChunkToFilesMap    chunkToFiles;   // chunkID -> vector<int32_t> fileIds
-		SegmentedFileCounts fileState;     // fileId  -> seenCount (via buckets)
-
-		// Helper: fetch and cache file IDs for a chunk (kept as lambda to keep timers local)
-		auto get_files_for_chunk = [&](int32_t chunkID) -> const std::vector<int32_t>& {
-			auto it = chunkToFiles.find(chunkID);
-			if (it != chunkToFiles.end()) {
-				return it->second; // cache hit, no timing
-			}
-
-			TIMER_BEGIN(3);
-			DocumentPtr document = searcher->doc(chunkID);
-			const auto& fileIDs  = document->getValues(nameField);
-			TIMER_END(3, total_fetch_files_time);
-
-			++num_chunks_fetched;
-
-			std::vector<int32_t> files;
-			files.reserve(fileIDs.size());
-			for (size_t i = 0; i < fileIDs.size(); ++i) {
-				const std::wstring& w = fileIDs[i];
-				// Assuming "name" is a decimal textual ID, like "12345"
-				int32_t fileId = std::stoi(w);
-				files.push_back(fileId);
-			}
-			num_files_fetched += files.size();
-
-			auto inserted = chunkToFiles.insert(std::make_pair(chunkID, std::move(files)));
-			return inserted.first->second;
-		};
-
-		TIMER_BEGIN(2);
-
-		const int32_t numTerms = (int32_t)sorted_termIDs_by_matches.size();
-		if (numTerms == 0) {
-			TIMER_END(2, total_intersection_time);
-			return results;
-		}
-
-		int32_t termsProcessed = 0;
-
-		for (int32_t termIndex = 0; termIndex < numTerms; ++termIndex) {
-			int32_t termId = sorted_termIDs_by_matches[termIndex];
-			size_t advancedThisTerm = 0;
-
-			const auto& chunksForTerm = (*matchTracker)[termId];
-
-			for (size_t idx = 0; idx < chunksForTerm.size(); ++idx) {
-				int32_t chunkID = chunksForTerm[idx];
-				const std::vector<int32_t>& files = get_files_for_chunk(chunkID);
-
-				if (termIndex == 0) {
-					for (size_t fi = 0; fi < files.size(); ++fi) {
-						int32_t fid = files[fi];
-						uint16_t& cnt = fileState.getOrCreate(fid);
-						if (cnt == 0) {
-							cnt = 1;
-						}
-					}
-				}
-				else {
-					for (size_t fi = 0; fi < files.size(); ++fi) {
-						int32_t fid = files[fi];
-						uint16_t* cntPtr = fileState.getIfExists(fid);
-						if (!cntPtr) {
-							// never seen before; can't be in intersection
-							continue;
-						}
-						uint16_t& cnt = *cntPtr;
-						if (cnt == (uint16_t)termIndex) {
-							cnt = (uint16_t)(termIndex + 1);
-							++advancedThisTerm;
-						}
-					}
-				}
-			}
-
-			if (termIndex > 0 && advancedThisTerm == 0) {
-				no_common_files = true;
-				termsProcessed = termIndex + 1;
-				break;
-			}
-
-			termsProcessed = termIndex + 1;
-		}
-
-		TIMER_END(2, total_intersection_time);
-
-
-		// --- Build final results: files that survived all processed terms ---
-		if (!no_common_files && termsProcessed == numTerms) {
-			fileState.collectResults((uint16_t)numTerms, results);
-		}
-
-		// --- Memory estimates for chunkToFiles & fileState ---
-		size_t chunkToFiles_bytes = estimateChunkToFilesBytes(chunkToFiles);
-		size_t fileState_bytes    = fileState.memoryUsageBytes();
-
-		size_t segmentsUsed = 0;
-		uint32_t maxSegIdx = 0;
-		for (uint32_t i = 0; i < fileState.segments.size(); ++i) {
-			if (fileState.segments[i]) {
-				++segmentsUsed;
-				maxSegIdx = i;
-			}
-		}
-
-		std::cout << "chunkToFiles size bytes: " << chunkToFiles_bytes
-				<< ", fileState size bytes: "  << fileState_bytes
-				<< ", segmentsUsed=" << segmentsUsed
-				<< ", segmentsCapacity=" << fileState.segments.capacity()
-				<< ", maxSegIdx=" << maxSegIdx
-				<< std::endl;
-
-		// Stats / logging
-		std::cout << "Number of chunks (m_docIds): " << m_docIds.size()
-				<< ", Unique chunks fetched: "    << num_chunks_fetched
-				<< ", Total files fetched: "      << num_files_fetched
-				<< ", matchTracker size in bytes: " << matchTracker_total_bytes
-				<< std::endl;
-		
-		printf("Sorting keywords by number of chunks time: %.3f\n",
-			total_sorting_keywords_time / 1000000.0);
-		printf("Performing intersection time: %.3f\n",
-			total_intersection_time / 1000000.0);
-		printf("Fetch files time: %.3f\n",
-			total_fetch_files_time / 1000000.0);
-
-		return results;
+		std::vector<int32_t> all_terms((int32_t)matchTracker->size());
+		for (int32_t i = 0; i < (int32_t)matchTracker->size(); ++i) all_terms[i] = i;
+		return getResultsFromSearcherInclExcl(searcher, matchTracker, all_terms, {});
 	}
 
-	virtual std::vector<std::string> getResultsFromSearcherNot(
+	virtual std::vector<std::string> getResultsFromSearcherInclExcl(
     IndexSearcherPtr searcher,
     std::vector<std::vector<int32_t>>* matchTracker,
     std::vector<int32_t> included_terms,
@@ -740,227 +495,6 @@ public:
 
 		return results;
 	}
-
-
-	virtual std::vector<std::string> getResultsFromSearcherCachedIntersection(
-    IndexSearcherPtr searcher,
-    std::vector<std::vector<int32_t>>* matchTracker)
-	{
-		TIMER_DECLARE(1);
-		TIMER_DECLARE(2);
-		TIMER_DECLARE(3);
-		TIMER_DECLARE(4);
-		TIMER_DECLARE(5);
-		double total_sorting_keywords_time = 0, total_intersection_time = 0, total_fetch_files_time = 0,
-			total_handling_chunks_processed_time = 0, total_handling_file_chunk_tags = 0;
-
-		int total_match_tracker_size = 0;
-		for (int i = 0; i < matchTracker->size(); i++)
-		{
-			total_match_tracker_size += (*matchTracker)[i].size();
-		}
-		std::cout << "MATCH TRACKER SIZE: " << total_match_tracker_size << std::endl;
-
-		std::vector<std::string> results;
-		bool no_common_files = false;
-		uint32_t num_files_fetched = 0, num_chunks_processed = 0;
-		size_t matchTracker_total_bytes = sizeof(*matchTracker);  // stack size (outer vector control block)
-		matchTracker_total_bytes += (*matchTracker).capacity() * sizeof(std::vector<int32_t>); // array of inner vector objects
-		for (const auto& inner : *matchTracker)
-			matchTracker_total_bytes += inner.capacity() * sizeof(int32_t); // heap storage of each inner vector
-
-		// Heuristic: Sort the keywords by the size of their vector (number of chunks)
-		TIMER_BEGIN(1);
-		std::vector<int32_t> sorted_termIDs_by_matches(matchTracker->size());
-		for (int32_t i = 0; i < (int32_t)matchTracker->size(); ++i)
-			sorted_termIDs_by_matches[i] = i;
-		std::sort(sorted_termIDs_by_matches.begin(), sorted_termIDs_by_matches.end(),
-				[matchTracker](int32_t t1, int32_t t2) {
-					return (*matchTracker)[t1].size() < (*matchTracker)[t2].size();
-				});
-		TIMER_END(1, total_sorting_keywords_time);
-
-		TIMER_BEGIN(2);
-		static const std::wstring nameField = toWstring("name");
-
-		// --- Internal wstring structures ---
-		std::unordered_set<std::string> result;
-		std::unordered_map<int32_t, std::vector<std::string>> processedChunks; // chunkID → fileNames (wstring)
-		std::unordered_map<std::string, std::vector<int32_t>> fileChunkTags;   // fileName → chunkIDs
-
-		// --- Seed from the first term ---
-		for (int32_t chunkID : (*matchTracker)[sorted_termIDs_by_matches[0]]) {
-			num_chunks_processed++;
-			TIMER_BEGIN(3);
-			DocumentPtr document = searcher->doc(chunkID);
-			const auto& fileIDs = document->getValues(nameField);
-			TIMER_END(3, total_fetch_files_time);
-			num_files_fetched += fileIDs.size();
-
-			for (const auto& fileID : fileIDs) {
-				std::string utf8Filename = StringUtils::toUTF8(fileID);
-				result.insert(utf8Filename);
-				TIMER_BEGIN(4);
-				processedChunks[chunkID].push_back(utf8Filename); // track which chunks contributed
-				TIMER_END(4, total_handling_chunks_processed_time);
-
-				TIMER_BEGIN(5);
-				fileChunkTags[utf8Filename].push_back(chunkID);   // track which chunks exist in this file
-				TIMER_END(5, total_handling_file_chunk_tags);
-			}
-		}
-		std::cout << "NUM_CHUNKS_PROCESSED: " << num_chunks_processed << " MAP_SIZE: " << processedChunks.size() << std::endl; 
-		bool is_new_chunk;
-
-		// --- Perform intersection ---
-		for (int32_t idx = 1; idx < (int32_t)sorted_termIDs_by_matches.size(); ++idx) {
-			std::unordered_set<std::string> intersection;
-			int32_t current_term = sorted_termIDs_by_matches[idx];
-
-			const std::vector<std::string>* cachedFileIDs = nullptr;
-			Lucene::Collection<std::wstring> freshFileIDs;
-
-			for (int32_t chunkID : (*matchTracker)[current_term]) {
-				TIMER_BEGIN(4);
-				auto itProcessed = processedChunks.find(chunkID);
-				TIMER_END(4, total_handling_chunks_processed_time);
-				if (itProcessed != processedChunks.end()) {
-					if (itProcessed->second.empty()) {
-						// ghost chunk
-						continue;
-					}
-					is_new_chunk = false;
-					cachedFileIDs = &itProcessed->second;
-				} else {
-					is_new_chunk = true;
-					num_chunks_processed++;
-					processedChunks[chunkID] = std::vector<std::string>();
-					TIMER_BEGIN(3);
-					DocumentPtr document = searcher->doc(chunkID);
-					freshFileIDs = document->getValues(nameField);
-					TIMER_END(3, total_fetch_files_time);
-					num_files_fetched += freshFileIDs.size();
-				}
-				auto handle_file_drop = [&](const std::string& fileName) {
-					// fileID dropped out; remove from contributors of all chunks that listed it
-					TIMER_BEGIN(4);
-					TIMER_BEGIN(5);
-
-					auto itChunks = fileChunkTags.find(fileName);
-					if (itChunks != fileChunkTags.end()) {
-						auto& chunks = itChunks->second;
-						for (int32_t chunk_to_remove : chunks) {
-							auto itC = processedChunks.find(chunk_to_remove);
-							if (itC == processedChunks.end()) continue;
-							auto& vec = itC->second;
-							vec.erase(std::remove(vec.begin(), vec.end(), fileName), vec.end());
-						}
-						chunks.clear(); // mark as ghost
-					}
-
-					TIMER_END(4, total_handling_chunks_processed_time);
-					TIMER_END(5, total_handling_file_chunk_tags);
-				};
-
-				if (is_new_chunk) {
-					for (const auto& fileID : freshFileIDs) {
-						std::string utf8Filename = StringUtils::toUTF8(fileID);
-						if (fileChunkTags[utf8Filename].empty()) {
-							// ghost fileID, no need to check intersection
-							continue;
-						}
-						if (result.find(utf8Filename) != result.end()) {
-							intersection.insert(utf8Filename);
-
-							TIMER_BEGIN(4);
-							processedChunks[chunkID].push_back(utf8Filename);
-							TIMER_END(4, total_handling_chunks_processed_time);
-
-							TIMER_BEGIN(5);
-							fileChunkTags[utf8Filename].push_back(chunkID);
-							TIMER_END(5, total_handling_file_chunk_tags);
-						}
-						else {
-							// fileID dropped out; remove from contributors of all chunks that listed it
-							handle_file_drop(utf8Filename);
-						}
-					}
-				} else {
-					// use cached vector<wstring>
-					for (const std::string& fileName : *cachedFileIDs) {
-						if (result.find(fileName) != result.end()) {
-							intersection.insert(fileName);
-						} else {
-							// fileID dropped out; remove from contributors of all chunks that listed it
-							handle_file_drop(fileName);
-						}
-					}
-				}
-			}
-
-			if (intersection.empty()) { // no common files, break
-				no_common_files = true;
-				break;
-			}
-			result = std::move(intersection);
-		}
-		TIMER_END(2, total_intersection_time);
-
-		// --- Final result already in wstring ---
-		if (!no_common_files) {
-			results.reserve(result.size());
-			for (const std::string& fileName : result)
-				results.push_back(fileName);
-		}
-
-		size_t processedChunks_bytes =
-		sizeof(processedChunks)
-		+ processedChunks.bucket_count() * sizeof(void*)
-		+ ([processedChunks]{
-			size_t sum = 0;
-			for (const auto& p : processedChunks) {
-				sum += sizeof(p.first);                            // chunkID
-				sum += sizeof(p.second) + p.second.capacity() * sizeof(std::string);  // vector control + ptrs
-				for (const auto& s : p.second)
-					sum += sizeof(s) + s.capacity();               // string memory
-				sum += sizeof(void*) * 2;                          // node overhead
-			}
-			return sum;
-		})();
-		size_t fileChunkTags_bytes =
-		sizeof(fileChunkTags)
-		+ fileChunkTags.bucket_count() * sizeof(void*)
-		+ ([fileChunkTags]{
-			size_t sum = 0;
-			for (const auto& p : fileChunkTags) {
-				sum += sizeof(p.first) + p.first.capacity();       // filename string
-				sum += sizeof(p.second) + p.second.capacity() * sizeof(int32_t); // vector<int>
-				sum += sizeof(void*) * 2;                          // node overhead
-			}
-			return sum;
-		})();
-		std::cout << "processedChunks bytes = " << processedChunks_bytes
-          << ", fileChunkTags bytes = " << fileChunkTags_bytes
-          << ", TOTAL = " << (processedChunks_bytes + fileChunkTags_bytes)
-          << std::endl;
-
-
-
-		std::wcout << L"Number of chunks: " << m_docIds.size()
-				<< L", Total files fetched: " << num_files_fetched
-				<< L", number of chunks processed: " << num_chunks_processed
-				<< L", matchTracker size in bytes: " << matchTracker_total_bytes
-				<< std::endl;
-
-		printf("Sorting keywords by number of chunks time: %.3f\n", total_sorting_keywords_time / 1000000);
-		printf("Performing intersection time: %.3f\n", total_intersection_time / 1000000);
-		printf("Fetch files time: %.3f\n", total_fetch_files_time / 1000000);
-		printf("Handling processed chunks: %.3f\n", total_handling_chunks_processed_time / 1000000);
-		printf("Handling fetched files: %.3f\n", total_handling_file_chunk_tags / 1000000);
-
-		return results;
-	}
-
 	
 	virtual std::map<std::string, double> getResultsFromSearcherWithScores(IndexSearcherPtr searcher) {
 		std::map<std::string, double> results;
@@ -1138,34 +672,22 @@ std::vector<std::string> search_index_complex_query(const std::string& query, co
 												   get_analyzer());
 	QueryPtr q = parser->parse(toWstring(query));
 	std::wcout << "query is: " << q->toString() << std::endl;
-	SetTerm s = SetTerm::newInstance();
-	q->extractTerms(s);
-	std::vector<String> terms;
-	terms.reserve(s.size());
-	for (const auto& term : s) {
-		terms.push_back(term->text());
-	}
-	std::vector<uint16_t> clauses;
-	clauses.reserve(s.size());
-	for (const auto& clause : boost::static_pointer_cast<BooleanQuery>(q)->getClauses()) {
-		clauses.push_back(clause->getOccur());
-	}
+	Collection<BooleanClausePtr> parsedClauses = boost::static_pointer_cast<BooleanQuery>(q)->getClauses();
 	BooleanQueryPtr new_query = newLucene<BooleanQuery>();
-	std::vector<std::vector<int32_t>> docBitmaps(s.size());
+	std::vector<std::vector<int32_t>> docBitmaps(parsedClauses.size());
 	std::vector<int32_t> included_terms;
 	std::vector<int32_t> excluded_terms;
-	int i = 0;
-	for (size_t i = 0; i < s.size(); i++) {
-		new_query->add(newLucene<TrackingTermQuery2>(newLucene<Term>(toWstring("data"), terms[i]), i, &docBitmaps),
-					BooleanClause::SHOULD);
-		std::cout << "S SIZE: " << s.size() << " CLAUSES SIZE: " << clauses.size() << std::endl;
-		if (clauses[s.size() - i - 1] != BooleanClause::MUST_NOT) {
+	for (size_t i = 0; i < parsedClauses.size(); i++) {
+		String termText = boost::static_pointer_cast<TermQuery>(parsedClauses[i]->getQuery())->getTerm()->text();
+		uint16_t occur = parsedClauses[i]->getOccur();
+		new_query->add(newLucene<TrackingTermQuery2>(newLucene<Term>(toWstring("data"), termText), i, &docBitmaps),
+					   BooleanClause::SHOULD);
+		if (occur != BooleanClause::MUST_NOT) {
 			included_terms.push_back(i);
-		}
-		else {
+		} else {
 			excluded_terms.push_back(i);
 		}
-		std::wcout << "Term: " << terms[i] << " Occur: " << clauses[s.size() - i - 1] << std::endl;
+		std::wcout << "Term: " << termText << " Occur: " << occur << std::endl;
 	}
 	return search_query_in_index_not(new_query, included_terms, excluded_terms, index, &docBitmaps, queue);
 }
@@ -1220,7 +742,7 @@ std::vector<std::string> search_keywords_in_index_and(const std::vector<std::str
 	return search_query_in_index(query, index, queue);
 }
 
-std::vector<std::string> search_keywords_in_index_batched_and(const std::vector<std::string>& keywords, 
+std::vector<std::string> search_must_keywords_in_index_bitmap(const std::vector<std::string>& keywords, 
 												  const std::string& index, 
 												  SyncQueue* queue) {
 
@@ -1244,10 +766,10 @@ std::vector<std::string> search_keywords_in_index_batched_and(const std::vector<
 	TIMER_END(1, query_creation_time);
 	printf("query creation time: %.3f\n", query_creation_time / 1000000);
 	
-	return search_query_in_index_tracking(query, index, &docBitmaps, keywords.size(), queue);
+	return search_query_in_index_tracking_bitmap(query, index, &docBitmaps, keywords.size(), queue);
 }
 
-std::vector<std::string> search_keywords_in_index_batched_and2(const std::vector<std::string>& keywords, 
+std::vector<std::string> search_must_keywords_in_index_incremental(const std::vector<std::string>& keywords, 
 												   const std::string& index, 
 												   SyncQueue* queue) {
 
@@ -1271,7 +793,7 @@ std::vector<std::string> search_keywords_in_index_batched_and2(const std::vector
 	TIMER_END(1, query_creation_time);
 	printf("query creation time: %.3f\n", query_creation_time / 1000000);
 	
-	return search_query_in_index_tracking2(query, index, &docBitmaps, queue);
+	return search_query_in_index_tracking_vector(query, index, &docBitmaps, queue);
 }
 
 std::vector<std::string> search_query_in_index(const QueryPtr& query, const std::string& index, SyncQueue* queue) {
@@ -1309,7 +831,7 @@ std::vector<std::string> search_query_in_index(const QueryPtr& query, const std:
 	return results;
 }
 
-std::vector<std::string> search_query_in_index_tracking(const QueryPtr& query, const std::string& index, std::unordered_map<int32_t, boost::dynamic_bitset<>>* docBitmaps, size_t num_keywords, SyncQueue* queue) {
+std::vector<std::string> search_query_in_index_tracking_bitmap(const QueryPtr& query, const std::string& index, std::unordered_map<int32_t, boost::dynamic_bitset<>>* docBitmaps, size_t num_keywords, SyncQueue* queue) {
 	MyHitCollectorPtr collector = newLucene<MyHitCollector>(queue);
 	double doc_id_lookup_time = 0, doc_fetch_lookup_time = 0;
 	std::vector<std::string> results;
@@ -1330,7 +852,7 @@ std::vector<std::string> search_query_in_index_tracking(const QueryPtr& query, c
 		if (destor.is_threaded_lookup) { 
 			results = collector->m_results;
 		} else {
-			results = collector->getResultsFromSearcherWithTracking(searcher, docBitmaps, num_keywords);
+			results = collector->getResultsFromSearcherWithTrackingBitmap(searcher, docBitmaps, num_keywords);
 		}
 		TIMER_END(2, doc_fetch_lookup_time);
 		TIMER_BEGIN(4);
@@ -1361,7 +883,7 @@ IoStats getIoStats() {
     return s;
 }
 
-std::vector<std::string> search_query_in_index_tracking2(const QueryPtr& query, const std::string& index, std::vector<std::vector<int32_t>>* docBitmaps, SyncQueue* queue) {
+std::vector<std::string> search_query_in_index_tracking_vector(const QueryPtr& query, const std::string& index, std::vector<std::vector<int32_t>>* docBitmaps, SyncQueue* queue) {
 	MyHitCollectorPtr collector = newLucene<MyHitCollector>(queue);
 	double doc_id_lookup_time = 0, doc_fetch_lookup_time = 0;
 	std::vector<std::string> results;
@@ -1379,12 +901,15 @@ std::vector<std::string> search_query_in_index_tracking2(const QueryPtr& query, 
 		TIMER_END(1, doc_id_lookup_time);
 		IoStats before = getIoStats();
 		TIMER_BEGIN(2);
-		if (destor.is_threaded_lookup) { 
+		if (destor.is_threaded_lookup) {
 			results = collector->m_results;
 		} else {
-			//results = collector->getResultsFromSearcherWithTracking2(searcher, docBitmaps);
-			results = collector->getResultsFromSearcherIncrementalIntersectionDynamic(searcher, docBitmaps);
-			//results = collector->getResultsFromSearcherCachedIntersection(searcher, docBitmaps);
+			switch (destor.and_impl) {
+			case AND_IMPL_INCREMENTAL:
+			default:
+				results = collector->getResultsFromSearcherWithTrackingVector(searcher, docBitmaps);
+				break;
+			}
 		}
 		TIMER_END(2, doc_fetch_lookup_time);
 		IoStats after = getIoStats();
@@ -1423,7 +948,7 @@ std::vector<std::string> search_query_in_index_not(const QueryPtr& query, std::v
 		if (destor.is_threaded_lookup) { 
 			results = collector->m_results;
 		} else {
-			results = collector->getResultsFromSearcherNot(searcher, docBitmaps, included_terms, excluded_terms);
+			results = collector->getResultsFromSearcherInclExcl(searcher, docBitmaps, included_terms, excluded_terms);
 		}
 		TIMER_END(2, doc_fetch_lookup_time);
 		IoStats after = getIoStats();
