@@ -356,7 +356,6 @@ void do_naive_and_lookup(unsigned char **keywords, size_t keywords_num) {
 	std::vector<std::string> keywords_vec(keywords_num);
 	for (int i = 0; i < keywords_num; i++, optind++) {
 		keywords_vec[i] = (const char*)keywords[i];
-		std::cout << keywords_vec[i] << std::endl;
 	}
 	TIMER_END(5, keywords_load_time);
 	TIMER_DECLARE(1);
@@ -364,6 +363,24 @@ void do_naive_and_lookup(unsigned char **keywords, size_t keywords_num) {
 	std::vector<std::string> results(search_keywords_in_index_and(keywords_vec, NAIVE_INDEX_DIR));
 	TIMER_END(1, total_lookup_time);
 	printf("keywords load time: %.3f\n", keywords_load_time / 1000000);
+	FILE* results_file = fopen("lookup_results.out", "wb");
+	for	(const std::string& result : results) {
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	}
+	fclose(results_file);
+	total_lookup_time /= 1000000;
+	printf("lookup time: %.3f\n", total_lookup_time);
+	printf("Number of results: %d\n", results.size());
+}
+
+void do_naive_lookup_using_parser(const std::string& query) {
+	destor_log(DESTOR_NOTICE, "naive lookup");
+	puts("==== naive query lookup start ====");
+	double total_lookup_time = 0;
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+	std::vector<std::string> results(search_index(query, NAIVE_INDEX_DIR));
+	TIMER_END(1, total_lookup_time);
 	FILE* results_file = fopen("lookup_results.out", "wb");
 	for	(const std::string& result : results) {
 		fprintf(results_file, "found result: %s\n", result.c_str());
@@ -1026,69 +1043,99 @@ void do_deduplicated_lookup_using_parser(const std::string& query) {
 	printf("Number of results: %d\n", found_in_files.size());
 }
 
-void do_deduplicated_AND_lookup(unsigned char **keywords, size_t keywords_num) {
-
-	double total_lookup_time = 0, keywords_load_time = 0;
-	destor_log(DESTOR_NOTICE, "dedup AND lookup");
-	puts("==== deduplicated AND lookup start ====");
-	TIMER_DECLARE(5);
-	TIMER_BEGIN(5);
-	std::vector<std::string> keywords_vec(keywords_num);
-	for (int i = 0; i < keywords_num; i++, optind++) {
-		keywords_vec[i] = (const char*)keywords[i];
-	}
-	TIMER_END(5, keywords_load_time);
-	TIMER_DECLARE(1);
-	TIMER_BEGIN(1);
-	// potential duplicate results? should we then move this to a set like they do in the previous function?
-	// something to keep in mind.
-	std::unordered_map<std::string, std::set<std::string>> results;
+// Resolves file IDs to paths via pathstore.
+static std::set<std::string> resolve_file_ids(const std::vector<std::string>& file_ids) {
 	init_pathstore();
-	std::vector<std::string> chunks;
-	for (auto keyword : keywords_vec) {
-		chunks = search_index(keyword, DEDUP_INDEX_DIR);
-		std::set<std::string> found_in_files;
-		for (const auto& chunk : chunks) {
-			if (destor.is_textual_doc_id) {
-				found_in_files.insert(get_path(std::atoi(chunk.data())));
-			} else {
-				found_in_files.insert(get_path(*(uint32_t*)chunk.data()));
-			}
-		}
-		results.emplace(keyword, found_in_files);
+	std::set<std::string> paths;
+	for (const auto& id : file_ids) {
+		if (destor.is_textual_doc_id)
+			paths.insert(get_path(std::atoi(id.data())));
+		else
+			paths.insert(get_path(*(uint32_t*)id.data()));
 	}
 	close_pathstore();
-	std::set<std::string> results_set;
-    auto it = results.find(keywords_vec[0]);
-	if (it != results.end()) {
-        results_set = it->second;
-    }
-    // Intersect with the file lists of remaining keywords
-    for (size_t i = 1; i < keywords_vec.size(); ++i) {
-        auto it = results.find(keywords_vec[i]);
-        if (it == results.end()) {
-           break;  // One keyword not found means intersection is empty
-        }
-        std::set<std::string> tempSet;
-        std::set_intersection(
-            results_set.begin(), results_set.end(),
-            it->second.begin(), it->second.end(),
-            std::inserter(tempSet, tempSet.begin())
-        );
-        
-        results_set = std::move(tempSet);
-        if (results_set.empty()) break;  // Early exit if no common files
-    }
+	return paths;
+}
+
+void do_deduplicated_NOT_lookup(const std::string& query) {
+	/**
+	 * Assuming no offsets, no ranking, in-doc reverse mapping and indirect-path-strings
+	 */
+	destor_log(DESTOR_NOTICE, "dedup NOT lookup using parser");
+
+	puts("==== deduplicated NOT lookup using parser start ====");
+	double total_lookup_time = 0, index_lookup_time = 0, indirection_time = 0;
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+	TIMER_DECLARE(2);
+	TIMER_BEGIN(2);
+	// potential duplicate results? should we then move this to a set like they do in the previous function?
+	// something to keep in mind.
+	std::vector<std::string> file_ids = search_index_complex_query(query, DEDUP_INDEX_DIR);
+	TIMER_END(2, index_lookup_time);
+	TIMER_DECLARE(3);
+	TIMER_BEGIN(3);
+	std::set<std::string> found_in_files = resolve_file_ids(file_ids);
+	TIMER_END(3, indirection_time);
 	TIMER_END(1, total_lookup_time);
-	printf("keywords load time: %.3f\n", keywords_load_time / 1000000);
 	FILE* results_file = fopen("dedup_lookup_results.out", "wb");
-	for	(const std::string& result : results_set) {
+	for (const std::string& result : found_in_files)
 		fprintf(results_file, "found result: %s\n", result.c_str());
-	}
 	fclose(results_file);
+
 	total_lookup_time /= 1000000;
+	index_lookup_time /= 1000000;
+	indirection_time /= 1000000;
+
 	printf("lookup time: %.3f\n", total_lookup_time);
-	printf("Number of results: %d\n", results_set.size());
+	printf("index lookup time: %.3f\n", index_lookup_time);
+	printf("indirection time: %.3f\n", indirection_time);
+	printf("Number of results: %d\n", found_in_files.size());
+}
+
+void do_deduplicated_AND_lookup(unsigned char **keywords, size_t keywords_num) {
+
+	double total_lookup_time = 0, keyword_to_file_id_time = 0, file_id_to_path_time = 0;
+	destor_log(DESTOR_NOTICE, "dedup AND lookup (impl=%u)", destor.and_impl);
+	puts("==== deduplicated AND lookup start ====");
+
+	std::vector<std::string> keywords_vec(keywords_num);
+	for (size_t i = 0; i < keywords_num; i++)
+		keywords_vec[i] = (const char*)keywords[i];
+
+	TIMER_DECLARE(1);
+	TIMER_BEGIN(1);
+
+	TIMER_DECLARE(2);
+	TIMER_BEGIN(2);
+	std::vector<std::string> file_ids;
+	switch (destor.and_impl) {
+	case AND_IMPL_BITMAP:
+		file_ids = search_must_keywords_in_index_bitmap(keywords_vec, DEDUP_INDEX_DIR);
+		break;
+	case AND_IMPL_INCREMENTAL:
+	default:
+		file_ids = search_must_keywords_in_index_incremental(keywords_vec, DEDUP_INDEX_DIR);
+		break;
+	}
+	TIMER_END(2, keyword_to_file_id_time);
+
+	TIMER_DECLARE(4);
+	TIMER_BEGIN(4);
+	std::set<std::string> found_in_files = resolve_file_ids(file_ids);
+	TIMER_END(4, file_id_to_path_time);
+
+	TIMER_END(1, total_lookup_time);
+
+	FILE* results_file = fopen("dedup_lookup_results.out", "wb");
+	for (const std::string& result : found_in_files)
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	fclose(results_file);
+
+	printf("total lookup time: %.3f\n", total_lookup_time / 1000000);
+	printf("keyword to file id lookup time: %.3f\n", keyword_to_file_id_time / 1000000);
+	printf("file id to path time: %.3f\n", file_id_to_path_time / 1000000);
+	printf("Number of results: %zu\n", found_in_files.size());
 }
 
 struct IndexLookup {
