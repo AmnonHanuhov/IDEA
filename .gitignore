@@ -30,3 +30,32 @@
 *.exe
 *.out
 *.app
+
+# Build output
+build/
+
+# External dependencies (downloaded/extracted locally)
+boost_1_58_0/
+boost_1_58_0.tar.gz
+db-4.8.30/
+db-4.8.30.zip
+
+# Runtime data (produced by destor during backup/indexing)
+working_directories/
+
+# Experiment outputs and logs
+*.log
+results_*.json
+graphs/
+slides/
+
+# Python cache
+scripts/__pycache__/
+*.pyc
+
+# IDE config
+.vscode/
+
+# Scratch files
+temp.txt
+backup_output.txt
