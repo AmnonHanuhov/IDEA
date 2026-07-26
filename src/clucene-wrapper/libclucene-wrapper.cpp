@@ -23,6 +23,64 @@
 
 double searcher_load_time = 0, dtor_time = 0;
 
+static const uint32_t FILES_PER_SEG = 1024;
+
+// Build a per-chunk segment bitmask from the Lucene index.
+// bitmask[docId] has bit s set iff segment s (files [s*FILES_PER_SEG, (s+1)*FILES_PER_SEG))
+// contains at least one file that includes that chunk.
+static std::vector<uint64_t> buildSegmentBitmask(IndexReaderPtr reader) {
+    int32_t maxDoc = reader->maxDoc();
+    std::vector<uint64_t> bitmask(maxDoc, 0ULL);
+    static const std::wstring nameField = toWstring("name");
+    for (int32_t docId = 0; docId < maxDoc; ++docId) {
+        if (reader->isDeleted(docId)) continue;
+        DocumentPtr doc = reader->document(docId);
+        const auto& fileIDs = doc->getValues(nameField);
+        uint64_t mask = 0ULL;
+        for (size_t i = 0; i < fileIDs.size(); ++i) {
+            uint32_t seg = (uint32_t)std::stoi(fileIDs[i]) / FILES_PER_SEG;
+            if (seg < 64) mask |= (1ULL << seg);
+        }
+        bitmask[docId] = mask;
+    }
+    return bitmask;
+}
+
+// Build and persist the segment bitmask alongside the index.
+// Called once at indexing time so queries don't need to touch the reverse mapping.
+void saveSegmentBitmask(const std::string& index_path) {
+    auto reader = IndexReader::open(FSDirectory::open(toWstring(index_path)));
+    std::vector<uint64_t> bitmask = buildSegmentBitmask(reader);
+    reader->close();
+    std::string path = index_path + "/seg_bitmask.bin";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "saveSegmentBitmask: cannot write %s\n", path.c_str());
+        return;
+    }
+    fwrite(bitmask.data(), sizeof(uint64_t), bitmask.size(), f);
+    fclose(f);
+    printf("Segment bitmask saved: %zu entries, %.1f MB → %s\n",
+           bitmask.size(), bitmask.size() * 8.0 / (1 << 20), path.c_str());
+}
+
+// Load the pre-built segment bitmask from disk (flat sequential read).
+static std::vector<uint64_t> loadSegmentBitmask(const std::string& index_path) {
+    std::string path = index_path + "/seg_bitmask.bin";
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "loadSegmentBitmask: %s not found — run destor -o first\n", path.c_str());
+        return {};
+    }
+    fseek(f, 0, SEEK_END);
+    long bytes = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<uint64_t> bitmask((size_t)bytes / sizeof(uint64_t));
+    fread(bitmask.data(), sizeof(uint64_t), bitmask.size(), f);
+    fclose(f);
+    return bitmask;
+}
+
 extern int job;
 
 std::wstring toWstring(const std::string& str) {
@@ -314,7 +372,8 @@ public:
     IndexSearcherPtr searcher,
     std::vector<std::vector<int32_t>>* matchTracker,
     std::vector<int32_t> included_terms,
-    std::vector<int32_t> excluded_terms)
+    std::vector<int32_t> excluded_terms,
+    const std::vector<uint64_t>* seg_bitmask = nullptr)
 	{
 		TIMER_DECLARE(1);
 		TIMER_DECLARE(2);
@@ -329,6 +388,7 @@ public:
 
 		uint32_t num_files_fetched  = 0;
 		uint32_t num_chunks_fetched = 0;
+		size_t   seg_filter_skips   = 0;
 
 		// --- matchTracker size accounting ---
 		size_t matchTracker_total_bytes = sizeof(*matchTracker);
@@ -443,12 +503,29 @@ public:
 		// --- NOT filter: kill any AND-survivor that appears in excluded terms ---
 		size_t alive = candidates.size();
 
+		// Segment filter: candidate_mask has bit s set iff any candidate file is in segment s.
+		// An excluded chunk can be skipped entirely if none of its segments overlap with candidates.
+		uint64_t candidate_mask = 0;
+		if (seg_bitmask != nullptr) {
+			for (int32_t fid : candidates) {
+				uint32_t seg = (uint32_t)fid / FILES_PER_SEG;
+				if (seg < 64) candidate_mask |= (1ULL << seg);
+			}
+		}
+
 		for (size_t ei = 0; ei < excluded_terms.size(); ++ei) {
 			const int32_t exTermId = excluded_terms[ei];
 			const auto& exChunksForTerm = (*matchTracker)[exTermId];
 
 			for (size_t ci = 0; ci < exChunksForTerm.size(); ++ci) {
 				const int32_t chunkID = exChunksForTerm[ci];
+
+				if (seg_bitmask != nullptr && chunkID < (int32_t)seg_bitmask->size() &&
+				    ((*seg_bitmask)[chunkID] & candidate_mask) == 0) {
+					++seg_filter_skips;
+					continue;
+				}
+
 				const std::vector<int32_t>& files = get_files_for_chunk(chunkID);
 
 				for (size_t fi = 0; fi < files.size(); ++fi) {
@@ -489,6 +566,8 @@ public:
 				<< ", chunkToFiles buckets: " << chunkToFiles.bucket_count()
 				<< std::endl;
 
+		if (seg_filter_skips > 0)
+			printf("Seg filter skips: %zu\n", seg_filter_skips);
 		printf("Sorting included terms time: %.3f\n", total_sorting_keywords_time / 1000000.0);
 		printf("AND+NOT evaluation time: %.3f\n", total_intersection_time / 1000000.0);
 		printf("Fetch files time: %.3f\n", total_fetch_files_time / 1000000.0);
@@ -690,6 +769,62 @@ std::vector<std::string> search_index_complex_query(const std::string& query, co
 		std::wcout << "Term: " << termText << " Occur: " << occur << std::endl;
 	}
 	return search_query_in_index_not(new_query, included_terms, excluded_terms, index, &docBitmaps, queue);
+}
+
+// Same as search_index_complex_query but loads the pre-built segment bitmask
+// and passes it to the NOT filter to skip excluded chunks with no files in
+// any candidate segment (avoiding reverse-mapping lookups for those chunks).
+std::vector<std::string> search_index_complex_query_seg_filter(const std::string& query, const std::string& index, SyncQueue* queue) {
+	BooleanQuery::setMaxClauseCount(std::numeric_limits<int32_t>::max());
+	QueryParserPtr parser = newLucene<QueryParser>(LuceneVersion::LUCENE_30,
+	                                               toWstring("data"),
+	                                               get_analyzer());
+	QueryPtr q = parser->parse(toWstring(query));
+	std::wcout << "query is: " << q->toString() << std::endl;
+	Collection<BooleanClausePtr> parsedClauses = boost::static_pointer_cast<BooleanQuery>(q)->getClauses();
+	BooleanQueryPtr new_query = newLucene<BooleanQuery>();
+	std::vector<std::vector<int32_t>> docBitmaps(parsedClauses.size());
+	std::vector<int32_t> included_terms, excluded_terms;
+	for (size_t i = 0; i < parsedClauses.size(); i++) {
+		String termText = boost::static_pointer_cast<TermQuery>(parsedClauses[i]->getQuery())->getTerm()->text();
+		uint16_t occur = parsedClauses[i]->getOccur();
+		new_query->add(newLucene<TrackingTermQuery2>(newLucene<Term>(toWstring("data"), termText), i, &docBitmaps),
+		               BooleanClause::SHOULD);
+		if (occur != BooleanClause::MUST_NOT) included_terms.push_back(i);
+		else                                   excluded_terms.push_back(i);
+	}
+
+	MyHitCollectorPtr collector = newLucene<MyHitCollector>(queue);
+	double doc_id_lookup_time = 0, doc_fetch_lookup_time = 0, seg_build_time = 0;
+	std::vector<std::string> results;
+	TIMER_DECLARE(1); TIMER_DECLARE(2); TIMER_DECLARE(3); TIMER_DECLARE(4); TIMER_DECLARE(5);
+	{
+		TIMER_BEGIN(3);
+		IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+		TIMER_END(3, searcher_load_time);
+
+		TIMER_BEGIN(5);
+		std::vector<uint64_t> seg_bitmask = loadSegmentBitmask(index);
+		TIMER_END(5, seg_build_time);
+
+		TIMER_BEGIN(1);
+		searcher->search(new_query, nullptr, collector);
+		TIMER_END(1, doc_id_lookup_time);
+
+		TIMER_BEGIN(2);
+		results = collector->getResultsFromSearcherInclExcl(
+		    searcher, &docBitmaps, included_terms, excluded_terms,
+		    seg_bitmask.empty() ? nullptr : &seg_bitmask);
+		TIMER_END(2, doc_fetch_lookup_time);
+		TIMER_BEGIN(4);
+	}
+	TIMER_END(4, dtor_time);
+	printf("searcher load time: %.3f\n", searcher_load_time / 1000000);
+	printf("seg filter load time: %.3f\n", seg_build_time / 1000000);
+	printf("doc lookup time: %.3f\n", doc_id_lookup_time / 1000000);
+	printf("doc fetch lookup time: %.3f\n", doc_fetch_lookup_time / 1000000);
+	printf("destructors' time: %.3f\n", dtor_time / 1000000);
+	return results;
 }
 
 std::vector<std::string> search_keywords_in_index(const std::vector<std::string>& keywords, 

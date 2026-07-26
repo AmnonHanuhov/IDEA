@@ -30,6 +30,7 @@ extern void do_deduplicated_lookup_threaded(unsigned char **keywords_p, size_t k
 extern void do_deduplicated_lookup_using_parser(const std::string& query);
 extern void do_naive_lookup_using_parser(const std::string& query);
 extern void do_deduplicated_NOT_lookup(const std::string& query);
+extern void do_deduplicated_NOT_lookup_seg_filter(const std::string& query);
 extern void do_deduplicated_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 
 extern int load_config();
@@ -43,7 +44,7 @@ int job;
 /* : means argument is required.
  * :: means argument is optional.
  */
-const char * const short_options = "edyzsr:t:p:hlikvqnf:mgabc";
+const char * const short_options = "edyzsr:t:p:hlikvqnf:mgabcjo";
 
 #define OPT_AND_IMPL 1001
 
@@ -66,6 +67,8 @@ struct option long_options[] = {
 		{ "in-doc-load-time", 0, NULL, 'c'},
 		{ "reindex", 0, NULL, 'a'},
 		{ "no-short-keywords", 0, NULL, 'b'},
+		{ "dedup-seg-filter-not-lookup", 0, NULL, 'j'},
+		{ "build-seg-bitmask", 0, NULL, 'o'},
 		{ "and-impl", required_argument, NULL, OPT_AND_IMPL },
 		{ NULL, 0, NULL, 0 }
 };
@@ -435,6 +438,14 @@ int main(int argc, char **argv) {
 			job = DESTOR_DEDUPLICATED_NOT_LOOKUP;
 			break;
 		}
+		case 'j': {
+			job = DESTOR_DEDUPLICATED_NOT_LOOKUP_SEG_FILTER;
+			break;
+		}
+		case 'o': {
+			job = DESTOR_BUILD_SEG_BITMASK;
+			break;
+		}
 		case 'k': {
 			job = DESTOR_DEDUPLICATED_QUERY_PARSER_LOOKUP;
 			break;
@@ -614,6 +625,14 @@ int main(int argc, char **argv) {
 		do_deduplicated_NOT_lookup(query);
 		break;
 	}
+	case DESTOR_DEDUPLICATED_NOT_LOOKUP_SEG_FILTER: {
+		std::string query = argv[2];
+		do_deduplicated_NOT_lookup_seg_filter(query);
+		break;
+	}
+	case DESTOR_BUILD_SEG_BITMASK:
+		saveSegmentBitmask(std::string(DEDUP_INDEX_DIR));
+		break;
 	case DESTOR_NAIVE_INDEX:
 		do_naive_index();
 		sdsfree(path);

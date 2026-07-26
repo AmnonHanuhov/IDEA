@@ -721,7 +721,9 @@ void do_deduplicated_index() {
 	}
 	
 	TIMER_END(1, total_time);
-	
+
+	saveSegmentBitmask(std::string(DEDUP_INDEX_DIR));
+
 	puts("==== index end ====");
 
 	double throughput = data_size * 1000000 / (1024.0 * 1024 * total_time);
@@ -1091,6 +1093,28 @@ void do_deduplicated_NOT_lookup(const std::string& query) {
 	printf("index lookup time: %.3f\n", index_lookup_time);
 	printf("indirection time: %.3f\n", indirection_time);
 	printf("Number of results: %d\n", found_in_files.size());
+}
+
+void do_deduplicated_NOT_lookup_seg_filter(const std::string& query) {
+	destor_log(DESTOR_NOTICE, "dedup NOT lookup with segment bitmask filter");
+	puts("==== deduplicated NOT lookup (seg filter) start ====");
+	double total_lookup_time = 0, index_lookup_time = 0, indirection_time = 0;
+	TIMER_DECLARE(1); TIMER_BEGIN(1);
+	TIMER_DECLARE(2); TIMER_BEGIN(2);
+	std::vector<std::string> file_ids = search_index_complex_query_seg_filter(query, DEDUP_INDEX_DIR);
+	TIMER_END(2, index_lookup_time);
+	TIMER_DECLARE(3); TIMER_BEGIN(3);
+	std::set<std::string> found_in_files = resolve_file_ids(file_ids);
+	TIMER_END(3, indirection_time);
+	TIMER_END(1, total_lookup_time);
+	total_lookup_time /= 1000000;
+	index_lookup_time /= 1000000;
+	indirection_time  /= 1000000;
+	printf("lookup time: %.3f\n", total_lookup_time);
+	printf("index lookup time: %.3f\n", index_lookup_time);
+	printf("indirection time: %.3f\n", indirection_time);
+	printf("Number of results: %d\n", (int)found_in_files.size());
+	puts("==== deduplicated NOT lookup (seg filter) end ====");
 }
 
 void do_deduplicated_AND_lookup(unsigned char **keywords, size_t keywords_num) {
