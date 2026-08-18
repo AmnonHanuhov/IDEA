@@ -27,11 +27,25 @@ double searcher_load_time = 0, dtor_time = 0;
 
 static const uint32_t DEFAULT_FILES_PER_SEG = 1024;
 static const uint64_t SEG_BITMASK_MAGIC = 0x5345474D41534B32ULL; // "SEGMASK2" (dense)
+static const uint64_t SEG_SPARSE_MAGIC  = 0x5345475350415253ULL; // "SEGSPARS" (sparse)
 
-// Path of the bitmask file for a given segment size (encoded in the name so
-// several granularities can coexist).
-static std::string segBitmaskPath(const std::string& index_path, int files_per_seg) {
-    return index_path + "/seg_bitmask_" + std::to_string(files_per_seg) + ".bin";
+// Path of the bitmask file for a given segment size and representation (encoded
+// in the name so several granularities / formats can coexist).
+static std::string segBitmaskPath(const std::string& index_path, int files_per_seg, bool sparse) {
+    return index_path + (sparse ? "/seg_bitmask_sparse_" : "/seg_bitmask_")
+         + std::to_string(files_per_seg) + ".bin";
+}
+
+// True iff the two sorted segment-id lists share no element — the two-pointer
+// merge Lucene uses to intersect postings.  A skip is safe iff this is true.
+static inline bool segListsDisjoint(const uint16_t* a, const uint16_t* ae,
+                                    const uint16_t* b, const uint16_t* be) {
+    while (a < ae && b < be) {
+        if      (*a < *b) ++a;
+        else if (*b < *a) ++b;
+        else return false;   // common segment -> not disjoint
+    }
+    return true;
 }
 
 // Build and persist a per-chunk segment bitmask at a chosen granularity.
@@ -83,7 +97,7 @@ void saveSegmentBitmask(const std::string& index_path, int files_per_seg) {
         }
     }
 
-    std::string path = segBitmaskPath(index_path, files_per_seg);
+    std::string path = segBitmaskPath(index_path, files_per_seg, false);
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) {
         fprintf(stderr, "saveSegmentBitmask: cannot write %s\n", path.c_str());
@@ -99,35 +113,117 @@ void saveSegmentBitmask(const std::string& index_path, int files_per_seg) {
            out.size() * 8.0 / (1 << 20), path.c_str());
 }
 
-// Read-only, mmap-backed view of a per-chunk segment bitmask: `words` 64-bit
-// words per chunk; row(c) returns the words of chunk c.
+// Build and persist the SPARSE variant: per chunk, the sorted list of segment
+// ids it touches, in CSR form.  Layout:
+//     [magic][files_per_seg][num_chunks N][total_entries E]
+//     offsets : (N+1) x uint32   (entry index where each chunk's list starts)
+//     segs    :  E    x uint16   (sorted segment ids, concatenated)
+// Size is ~constant across granularities (a chunk touches ~fanout segments),
+// so it avoids the dense format's blow-up at fine segment sizes.
+void saveSegmentBitmaskSparse(const std::string& index_path, int files_per_seg) {
+    if (files_per_seg <= 0) files_per_seg = DEFAULT_FILES_PER_SEG;
+    auto reader = IndexReader::open(FSDirectory::open(toWstring(index_path)));
+    int32_t maxDoc = reader->maxDoc();
+    static const std::wstring nameField = toWstring("name");
+
+    // Pass 1 (decode once): per-chunk file IDs into CSR form + max file ID.
+    std::vector<uint32_t> flatFiles;
+    std::vector<uint64_t> offsets((size_t)maxDoc + 1, 0);
+    flatFiles.reserve((size_t)maxDoc * 4);
+    uint32_t maxFid = 0;
+    for (int32_t docId = 0; docId < maxDoc; ++docId) {
+        offsets[docId] = flatFiles.size();
+        if (reader->isDeleted(docId)) continue;
+        DocumentPtr doc = reader->document(docId);
+        const auto& fileIDs = doc->getValues(nameField);
+        for (size_t i = 0; i < fileIDs.size(); ++i) {
+            uint32_t f = (uint32_t)std::stoul(fileIDs[i]);
+            flatFiles.push_back(f);
+            if (f > maxFid) maxFid = f;
+        }
+    }
+    offsets[maxDoc] = flatFiles.size();
+    reader->close();
+
+    int numSegments = (int)(maxFid / (uint32_t)files_per_seg) + 1;
+    if (numSegments > 65535) {
+        fprintf(stderr, "saveSegmentBitmaskSparse: %d segments exceeds uint16 range; "
+                        "use a larger files-per-seg or widen the id type.\n", numSegments);
+        return;
+    }
+
+    // Pass 2 (in memory): sorted-unique segment list per chunk -> CSR.
+    std::vector<uint32_t> segOffsets((size_t)maxDoc + 1, 0);
+    std::vector<uint16_t> segData;
+    segData.reserve(flatFiles.size());
+    std::vector<uint16_t> tmp;
+    for (int32_t docId = 0; docId < maxDoc; ++docId) {
+        segOffsets[docId] = (uint32_t)segData.size();
+        tmp.clear();
+        for (uint64_t k = offsets[docId]; k < offsets[docId + 1]; ++k)
+            tmp.push_back((uint16_t)(flatFiles[k] / (uint32_t)files_per_seg));
+        std::sort(tmp.begin(), tmp.end());
+        tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
+        segData.insert(segData.end(), tmp.begin(), tmp.end());
+    }
+    segOffsets[maxDoc] = (uint32_t)segData.size();
+
+    std::string path = segBitmaskPath(index_path, files_per_seg, true);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "saveSegmentBitmaskSparse: cannot write %s\n", path.c_str());
+        return;
+    }
+    uint64_t header[4] = { SEG_SPARSE_MAGIC, (uint64_t)files_per_seg,
+                           (uint64_t)maxDoc, (uint64_t)segData.size() };
+    fwrite(header, sizeof(uint64_t), 4, f);
+    fwrite(segOffsets.data(), sizeof(uint32_t), segOffsets.size(), f);
+    fwrite(segData.data(), sizeof(uint16_t), segData.size(), f);
+    fclose(f);
+    double mb = (32 + segOffsets.size() * 4.0 + segData.size() * 2.0) / (1 << 20);
+    printf("Segment bitmask (sparse) saved: fps=%d, segments=%d, %d chunks, "
+           "%zu entries (%.2f seg/chunk), %.1f MB -> %s\n",
+           files_per_seg, numSegments, maxDoc, segData.size(),
+           (double)segData.size() / maxDoc, mb, path.c_str());
+}
+
+// Read-only, mmap-backed view of a per-chunk segment index in either format:
+//   dense  : `words` 64-bit words per chunk; row(c) returns them.
+//   sparse : CSR of sorted segment ids; segBegin(c)/segEnd(c) delimit c's list.
 struct SegBitmask {
+    bool            sparse = false;
     size_t          count = 0;        // number of chunks
     int             files_per_seg = DEFAULT_FILES_PER_SEG;
+    // dense
     const uint64_t* data = nullptr;   // first chunk's words
     int             words = 1;        // 64-bit words per chunk
+    // sparse
+    const uint32_t* offs = nullptr;   // (count+1) entry offsets
+    const uint16_t* segs = nullptr;   // concatenated sorted segment ids
     size_t size()  const { return count; }
     bool   empty() const { return count == 0; }
-    const uint64_t* row(size_t c) const { return data + c * (size_t)words; }
+    const uint64_t* row(size_t c)      const { return data + c * (size_t)words; }
+    const uint16_t* segBegin(size_t c) const { return segs + offs[c]; }
+    const uint16_t* segEnd(size_t c)   const { return segs + offs[c + 1]; }
 };
 
-// Map the pre-built segment bitmask into memory, once per (index,
-// files_per_seg) per process.  mmap avoids copying the file; pages fault in
-// only for the chunk IDs actually accessed and stay resident in the page cache
-// across process invocations, so repeated queries pay ~0 to load.
+// Map the pre-built segment index (dense or sparse) into memory, once per
+// (index, files_per_seg, format) per process.  mmap avoids copying the file;
+// pages fault in only for the chunk IDs actually accessed and stay resident in
+// the page cache across process invocations, so repeated queries pay ~0 to load.
 static const SegBitmask& loadSegmentBitmask(const std::string& index_path,
-                                            int files_per_seg) {
+                                            int files_per_seg, bool sparse) {
     if (files_per_seg <= 0) files_per_seg = DEFAULT_FILES_PER_SEG;
     static std::unordered_map<std::string, SegBitmask> cache;
-    std::string path = segBitmaskPath(index_path, files_per_seg);
+    std::string path = segBitmaskPath(index_path, files_per_seg, sparse);
     auto it = cache.find(path);
     if (it != cache.end()) return it->second;   // already mapped in this process
 
     SegBitmask sb;
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "loadSegmentBitmask: %s not found — run 'destor -o -P %d' first\n",
-                path.c_str(), files_per_seg);
+        fprintf(stderr, "loadSegmentBitmask: %s not found — run 'destor -o -P %d%s' first\n",
+                path.c_str(), files_per_seg, sparse ? " -S" : "");
         return cache.emplace(path, sb).first->second;
     }
     struct stat st;
@@ -136,10 +232,17 @@ static const SegBitmask& loadSegmentBitmask(const std::string& index_path,
         if (addr != MAP_FAILED) {
             const uint64_t* h = reinterpret_cast<const uint64_t*>(addr);
             if (h[0] == SEG_BITMASK_MAGIC) {
+                sb.sparse        = false;
                 sb.files_per_seg = (int)h[1];
                 sb.words         = (int)h[2];
                 sb.count         = (size_t)h[3];
                 sb.data          = h + 4;
+            } else if (h[0] == SEG_SPARSE_MAGIC) {
+                sb.sparse        = true;
+                sb.files_per_seg = (int)h[1];
+                sb.count         = (size_t)h[2];      // num_chunks (h[3] = total entries)
+                sb.offs          = reinterpret_cast<const uint32_t*>(h + 4);
+                sb.segs          = reinterpret_cast<const uint16_t*>(sb.offs + (sb.count + 1));
             } else {
                 fprintf(stderr, "loadSegmentBitmask: bad magic in %s\n", path.c_str());
             }
@@ -578,20 +681,33 @@ public:
 		// mask spans the same `words` 64-bit words as a chunk's row.
 		// An excluded chunk can be skipped entirely if none of its segments overlap.
 		const bool segFilter = (seg_bitmask != nullptr);
-		const int  segW      = segFilter ? seg_bitmask->words : 0;
+		const bool segSparse = segFilter && seg_bitmask->sparse;
+		const int  segW      = (segFilter && !segSparse) ? seg_bitmask->words : 0;
 		const int  segFPS    = segFilter ? seg_bitmask->files_per_seg
 		                                 : (int)DEFAULT_FILES_PER_SEG;
-		std::vector<uint64_t> candidate_mask;
+		std::vector<uint64_t> candidate_mask;   // dense
+		std::vector<uint16_t> cand_segs;        // sparse (sorted-unique segment ids)
 		if (segFilter) {
-			candidate_mask.assign(segW, 0ULL);
-			for (int32_t fid : candidates) {
-				uint32_t seg = (uint32_t)fid / (uint32_t)segFPS;
-				candidate_mask[seg >> 6] |= (1ULL << (seg & 63));
+			if (segSparse) {
+				cand_segs.reserve(candidates.size());
+				for (int32_t fid : candidates)
+					cand_segs.push_back((uint16_t)((uint32_t)fid / (uint32_t)segFPS));
+				std::sort(cand_segs.begin(), cand_segs.end());
+				cand_segs.erase(std::unique(cand_segs.begin(), cand_segs.end()), cand_segs.end());
+			} else {
+				candidate_mask.assign(segW, 0ULL);
+				for (int32_t fid : candidates) {
+					uint32_t seg = (uint32_t)fid / (uint32_t)segFPS;
+					candidate_mask[seg >> 6] |= (1ULL << (seg & 63));
+				}
 			}
 		}
 		// true iff chunkID's segments do not overlap the candidate set => skip.
 		auto segDisjoint = [&](int32_t chunkID) -> bool {
 			if (chunkID < 0 || (size_t)chunkID >= seg_bitmask->size()) return false;
+			if (segSparse)
+				return segListsDisjoint(seg_bitmask->segBegin(chunkID), seg_bitmask->segEnd(chunkID),
+				                        cand_segs.data(), cand_segs.data() + cand_segs.size());
 			const uint64_t* r = seg_bitmask->row(chunkID);
 			for (int w = 0; w < segW; ++w) if (r[w] & candidate_mask[w]) return false;
 			return true;
@@ -857,7 +973,7 @@ std::vector<std::string> search_index_complex_query(const std::string& query, co
 // Same as search_index_complex_query but loads the pre-built segment bitmask
 // and passes it to the NOT filter to skip excluded chunks with no files in
 // any candidate segment (avoiding reverse-mapping lookups for those chunks).
-std::vector<std::string> search_index_complex_query_seg_filter(const std::string& query, const std::string& index, int files_per_seg, SyncQueue* queue) {
+std::vector<std::string> search_index_complex_query_seg_filter(const std::string& query, const std::string& index, int files_per_seg, bool sparse, SyncQueue* queue) {
 	BooleanQuery::setMaxClauseCount(std::numeric_limits<int32_t>::max());
 	QueryParserPtr parser = newLucene<QueryParser>(LuceneVersion::LUCENE_30,
 	                                               toWstring("data"),
@@ -887,7 +1003,7 @@ std::vector<std::string> search_index_complex_query_seg_filter(const std::string
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(5);
-		const SegBitmask& seg_bitmask = loadSegmentBitmask(index, files_per_seg);
+		const SegBitmask& seg_bitmask = loadSegmentBitmask(index, files_per_seg, sparse);
 		TIMER_END(5, seg_build_time);
 
 		TIMER_BEGIN(1);

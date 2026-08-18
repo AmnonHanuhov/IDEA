@@ -1095,14 +1095,15 @@ void do_deduplicated_NOT_lookup(const std::string& query) {
 	printf("Number of results: %d\n", found_in_files.size());
 }
 
-void do_deduplicated_NOT_lookup_seg_filter(const std::string& query, int files_per_seg) {
+void do_deduplicated_NOT_lookup_seg_filter(const std::string& query, int files_per_seg, bool sparse) {
 	destor_log(DESTOR_NOTICE, "dedup NOT lookup with segment bitmask filter");
 	puts("==== deduplicated NOT lookup (seg filter) start ====");
 	printf("Segment size (files/seg): %d\n", files_per_seg);
+	printf("Segment format: %s\n", sparse ? "sparse" : "dense");
 	double total_lookup_time = 0, index_lookup_time = 0, indirection_time = 0;
 	TIMER_DECLARE(1); TIMER_BEGIN(1);
 	TIMER_DECLARE(2); TIMER_BEGIN(2);
-	std::vector<std::string> file_ids = search_index_complex_query_seg_filter(query, DEDUP_INDEX_DIR, files_per_seg);
+	std::vector<std::string> file_ids = search_index_complex_query_seg_filter(query, DEDUP_INDEX_DIR, files_per_seg, sparse);
 	TIMER_END(2, index_lookup_time);
 	TIMER_DECLARE(3); TIMER_BEGIN(3);
 	std::set<std::string> found_in_files = resolve_file_ids(file_ids);

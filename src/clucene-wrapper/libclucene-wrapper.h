@@ -46,8 +46,9 @@ std::vector<std::string> search_query_in_index(const QueryPtr& query, const std:
 std::vector<std::string> search_query_in_index_tracking_bitmap(const QueryPtr& query, const std::string& index, std::unordered_map<int32_t, boost::dynamic_bitset<>>* docBitmaps, size_t num_keywords, SyncQueue* queue = nullptr);
 std::vector<std::string> search_query_in_index_tracking_vector(const QueryPtr& query, const std::string& index, std::vector<std::vector<int32_t>>* docBitmaps, SyncQueue* queue = nullptr);
 std::vector<std::string> search_query_in_index_not(const QueryPtr& query, std::vector<int32_t> included_terms, std::vector<int32_t> excluded_terms, const std::string& index, std::vector<std::vector<int32_t>>* docBitmaps, SyncQueue* queue = nullptr);
-std::vector<std::string> search_index_complex_query_seg_filter(const std::string& query, const std::string& index, int files_per_seg = 1024, SyncQueue* queue = nullptr);
+std::vector<std::string> search_index_complex_query_seg_filter(const std::string& query, const std::string& index, int files_per_seg = 1024, bool sparse = false, SyncQueue* queue = nullptr);
 void saveSegmentBitmask(const std::string& index_path, int files_per_seg = 1024);
+void saveSegmentBitmaskSparse(const std::string& index_path, int files_per_seg = 1024);
 std::vector<std::string> search_keywords_in_index(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_keywords_in_index_and(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_must_keywords_in_index_bitmap(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);

@@ -364,6 +364,9 @@ struct destor {
 	/* segment size (files per segment) for the segment bitmask filter (-P) */
 	int seg_files_per_seg;
 
+	/* use the sparse (sorted segment-id list) representation instead of dense (-S) */
+	bool seg_sparse;
+
 }; // DedupSearch
 
 extern struct destor destor; // DedupSearch
