@@ -7,6 +7,8 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <iostream>
@@ -23,62 +25,130 @@
 
 double searcher_load_time = 0, dtor_time = 0;
 
-static const uint32_t FILES_PER_SEG = 1024;
+static const uint32_t DEFAULT_FILES_PER_SEG = 1024;
+static const uint64_t SEG_BITMASK_MAGIC = 0x5345474D41534B32ULL; // "SEGMASK2" (dense)
 
-// Build a per-chunk segment bitmask from the Lucene index.
-// bitmask[docId] has bit s set iff segment s (files [s*FILES_PER_SEG, (s+1)*FILES_PER_SEG))
-// contains at least one file that includes that chunk.
-static std::vector<uint64_t> buildSegmentBitmask(IndexReaderPtr reader) {
+// Path of the bitmask file for a given segment size (encoded in the name so
+// several granularities can coexist).
+static std::string segBitmaskPath(const std::string& index_path, int files_per_seg) {
+    return index_path + "/seg_bitmask_" + std::to_string(files_per_seg) + ".bin";
+}
+
+// Build and persist a per-chunk segment bitmask at a chosen granularity.
+//
+// A segment is a block of `files_per_seg` consecutive file IDs; a chunk's mask
+// has bit s set iff some file in segment s contains that chunk.  With finer
+// segments the number of segments exceeds 64, so each chunk's mask spans
+// `words` 64-bit words (words = ceil(numSegments/64)).  The file layout is:
+//     [magic][files_per_seg][words][num_chunks]  then num_chunks * words uint64.
+//
+// Built offline (once per size) so queries never touch the reverse mapping.  A
+// single pass decodes each chunk's file list into a flat CSR buffer — which also
+// yields the max file ID (hence the word count) — then bits are set in memory.
+void saveSegmentBitmask(const std::string& index_path, int files_per_seg) {
+    if (files_per_seg <= 0) files_per_seg = DEFAULT_FILES_PER_SEG;
+    auto reader = IndexReader::open(FSDirectory::open(toWstring(index_path)));
     int32_t maxDoc = reader->maxDoc();
-    std::vector<uint64_t> bitmask(maxDoc, 0ULL);
     static const std::wstring nameField = toWstring("name");
+
+    // Pass 1 (decode once): gather per-chunk file IDs into CSR form + max file ID.
+    std::vector<uint32_t> flatFiles;
+    std::vector<uint64_t> offsets((size_t)maxDoc + 1, 0);
+    flatFiles.reserve((size_t)maxDoc * 4);
+    uint32_t maxFid = 0;
     for (int32_t docId = 0; docId < maxDoc; ++docId) {
+        offsets[docId] = flatFiles.size();
         if (reader->isDeleted(docId)) continue;
         DocumentPtr doc = reader->document(docId);
         const auto& fileIDs = doc->getValues(nameField);
-        uint64_t mask = 0ULL;
         for (size_t i = 0; i < fileIDs.size(); ++i) {
-            uint32_t seg = (uint32_t)std::stoi(fileIDs[i]) / FILES_PER_SEG;
-            if (seg < 64) mask |= (1ULL << seg);
+            uint32_t f = (uint32_t)std::stoul(fileIDs[i]);
+            flatFiles.push_back(f);
+            if (f > maxFid) maxFid = f;
         }
-        bitmask[docId] = mask;
     }
-    return bitmask;
-}
-
-// Build and persist the segment bitmask alongside the index.
-// Called once at indexing time so queries don't need to touch the reverse mapping.
-void saveSegmentBitmask(const std::string& index_path) {
-    auto reader = IndexReader::open(FSDirectory::open(toWstring(index_path)));
-    std::vector<uint64_t> bitmask = buildSegmentBitmask(reader);
+    offsets[maxDoc] = flatFiles.size();
     reader->close();
-    std::string path = index_path + "/seg_bitmask.bin";
+
+    int numSegments = (int)(maxFid / (uint32_t)files_per_seg) + 1;
+    int words = (numSegments + 63) / 64;
+
+    // Pass 2 (in memory): set each chunk's segment bits across `words` words.
+    std::vector<uint64_t> out((size_t)maxDoc * words, 0ULL);
+    for (int32_t docId = 0; docId < maxDoc; ++docId) {
+        uint64_t* row = &out[(size_t)docId * words];
+        for (uint64_t k = offsets[docId]; k < offsets[docId + 1]; ++k) {
+            uint32_t seg = flatFiles[k] / (uint32_t)files_per_seg;
+            row[seg >> 6] |= (1ULL << (seg & 63));
+        }
+    }
+
+    std::string path = segBitmaskPath(index_path, files_per_seg);
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) {
         fprintf(stderr, "saveSegmentBitmask: cannot write %s\n", path.c_str());
         return;
     }
-    fwrite(bitmask.data(), sizeof(uint64_t), bitmask.size(), f);
+    uint64_t header[4] = { SEG_BITMASK_MAGIC, (uint64_t)files_per_seg,
+                           (uint64_t)words, (uint64_t)maxDoc };
+    fwrite(header, sizeof(uint64_t), 4, f);
+    fwrite(out.data(), sizeof(uint64_t), out.size(), f);
     fclose(f);
-    printf("Segment bitmask saved: %zu entries, %.1f MB → %s\n",
-           bitmask.size(), bitmask.size() * 8.0 / (1 << 20), path.c_str());
+    printf("Segment bitmask saved: fps=%d, segments=%d, words/chunk=%d, %d chunks, %.1f MB -> %s\n",
+           files_per_seg, numSegments, words, maxDoc,
+           out.size() * 8.0 / (1 << 20), path.c_str());
 }
 
-// Load the pre-built segment bitmask from disk (flat sequential read).
-static std::vector<uint64_t> loadSegmentBitmask(const std::string& index_path) {
-    std::string path = index_path + "/seg_bitmask.bin";
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) {
-        fprintf(stderr, "loadSegmentBitmask: %s not found — run destor -o first\n", path.c_str());
-        return {};
+// Read-only, mmap-backed view of a per-chunk segment bitmask: `words` 64-bit
+// words per chunk; row(c) returns the words of chunk c.
+struct SegBitmask {
+    size_t          count = 0;        // number of chunks
+    int             files_per_seg = DEFAULT_FILES_PER_SEG;
+    const uint64_t* data = nullptr;   // first chunk's words
+    int             words = 1;        // 64-bit words per chunk
+    size_t size()  const { return count; }
+    bool   empty() const { return count == 0; }
+    const uint64_t* row(size_t c) const { return data + c * (size_t)words; }
+};
+
+// Map the pre-built segment bitmask into memory, once per (index,
+// files_per_seg) per process.  mmap avoids copying the file; pages fault in
+// only for the chunk IDs actually accessed and stay resident in the page cache
+// across process invocations, so repeated queries pay ~0 to load.
+static const SegBitmask& loadSegmentBitmask(const std::string& index_path,
+                                            int files_per_seg) {
+    if (files_per_seg <= 0) files_per_seg = DEFAULT_FILES_PER_SEG;
+    static std::unordered_map<std::string, SegBitmask> cache;
+    std::string path = segBitmaskPath(index_path, files_per_seg);
+    auto it = cache.find(path);
+    if (it != cache.end()) return it->second;   // already mapped in this process
+
+    SegBitmask sb;
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "loadSegmentBitmask: %s not found — run 'destor -o -P %d' first\n",
+                path.c_str(), files_per_seg);
+        return cache.emplace(path, sb).first->second;
     }
-    fseek(f, 0, SEEK_END);
-    long bytes = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::vector<uint64_t> bitmask((size_t)bytes / sizeof(uint64_t));
-    fread(bitmask.data(), sizeof(uint64_t), bitmask.size(), f);
-    fclose(f);
-    return bitmask;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > (off_t)(4 * sizeof(uint64_t))) {
+        void* addr = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+        if (addr != MAP_FAILED) {
+            const uint64_t* h = reinterpret_cast<const uint64_t*>(addr);
+            if (h[0] == SEG_BITMASK_MAGIC) {
+                sb.files_per_seg = (int)h[1];
+                sb.words         = (int)h[2];
+                sb.count         = (size_t)h[3];
+                sb.data          = h + 4;
+            } else {
+                fprintf(stderr, "loadSegmentBitmask: bad magic in %s\n", path.c_str());
+            }
+        } else {
+            fprintf(stderr, "loadSegmentBitmask: mmap failed for %s\n", path.c_str());
+        }
+    }
+    close(fd);   // mapping stays valid after the fd is closed
+    return cache.emplace(path, sb).first->second;
 }
 
 extern int job;
@@ -373,7 +443,7 @@ public:
     std::vector<std::vector<int32_t>>* matchTracker,
     std::vector<int32_t> included_terms,
     std::vector<int32_t> excluded_terms,
-    const std::vector<uint64_t>* seg_bitmask = nullptr)
+    const SegBitmask* seg_bitmask = nullptr)
 	{
 		TIMER_DECLARE(1);
 		TIMER_DECLARE(2);
@@ -503,15 +573,29 @@ public:
 		// --- NOT filter: kill any AND-survivor that appears in excluded terms ---
 		size_t alive = candidates.size();
 
-		// Segment filter: candidate_mask has bit s set iff any candidate file is in segment s.
-		// An excluded chunk can be skipped entirely if none of its segments overlap with candidates.
-		uint64_t candidate_mask = 0;
-		if (seg_bitmask != nullptr) {
+		// Segment filter: candidate_mask has bit s set iff any candidate file is in
+		// segment s.  At fine granularities the segment count exceeds 64, so the
+		// mask spans the same `words` 64-bit words as a chunk's row.
+		// An excluded chunk can be skipped entirely if none of its segments overlap.
+		const bool segFilter = (seg_bitmask != nullptr);
+		const int  segW      = segFilter ? seg_bitmask->words : 0;
+		const int  segFPS    = segFilter ? seg_bitmask->files_per_seg
+		                                 : (int)DEFAULT_FILES_PER_SEG;
+		std::vector<uint64_t> candidate_mask;
+		if (segFilter) {
+			candidate_mask.assign(segW, 0ULL);
 			for (int32_t fid : candidates) {
-				uint32_t seg = (uint32_t)fid / FILES_PER_SEG;
-				if (seg < 64) candidate_mask |= (1ULL << seg);
+				uint32_t seg = (uint32_t)fid / (uint32_t)segFPS;
+				candidate_mask[seg >> 6] |= (1ULL << (seg & 63));
 			}
 		}
+		// true iff chunkID's segments do not overlap the candidate set => skip.
+		auto segDisjoint = [&](int32_t chunkID) -> bool {
+			if (chunkID < 0 || (size_t)chunkID >= seg_bitmask->size()) return false;
+			const uint64_t* r = seg_bitmask->row(chunkID);
+			for (int w = 0; w < segW; ++w) if (r[w] & candidate_mask[w]) return false;
+			return true;
+		};
 
 		for (size_t ei = 0; ei < excluded_terms.size(); ++ei) {
 			const int32_t exTermId = excluded_terms[ei];
@@ -520,8 +604,7 @@ public:
 			for (size_t ci = 0; ci < exChunksForTerm.size(); ++ci) {
 				const int32_t chunkID = exChunksForTerm[ci];
 
-				if (seg_bitmask != nullptr && chunkID < (int32_t)seg_bitmask->size() &&
-				    ((*seg_bitmask)[chunkID] & candidate_mask) == 0) {
+				if (segFilter && segDisjoint(chunkID)) {
 					++seg_filter_skips;
 					continue;
 				}
@@ -774,7 +857,7 @@ std::vector<std::string> search_index_complex_query(const std::string& query, co
 // Same as search_index_complex_query but loads the pre-built segment bitmask
 // and passes it to the NOT filter to skip excluded chunks with no files in
 // any candidate segment (avoiding reverse-mapping lookups for those chunks).
-std::vector<std::string> search_index_complex_query_seg_filter(const std::string& query, const std::string& index, SyncQueue* queue) {
+std::vector<std::string> search_index_complex_query_seg_filter(const std::string& query, const std::string& index, int files_per_seg, SyncQueue* queue) {
 	BooleanQuery::setMaxClauseCount(std::numeric_limits<int32_t>::max());
 	QueryParserPtr parser = newLucene<QueryParser>(LuceneVersion::LUCENE_30,
 	                                               toWstring("data"),
@@ -804,7 +887,7 @@ std::vector<std::string> search_index_complex_query_seg_filter(const std::string
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(5);
-		std::vector<uint64_t> seg_bitmask = loadSegmentBitmask(index);
+		const SegBitmask& seg_bitmask = loadSegmentBitmask(index, files_per_seg);
 		TIMER_END(5, seg_build_time);
 
 		TIMER_BEGIN(1);

@@ -30,7 +30,7 @@ extern void do_deduplicated_lookup_threaded(unsigned char **keywords_p, size_t k
 extern void do_deduplicated_lookup_using_parser(const std::string& query);
 extern void do_naive_lookup_using_parser(const std::string& query);
 extern void do_deduplicated_NOT_lookup(const std::string& query);
-extern void do_deduplicated_NOT_lookup_seg_filter(const std::string& query);
+extern void do_deduplicated_NOT_lookup_seg_filter(const std::string& query, int files_per_seg);
 extern void do_deduplicated_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 
 extern int load_config();
@@ -44,7 +44,7 @@ int job;
 /* : means argument is required.
  * :: means argument is optional.
  */
-const char * const short_options = "edyzsr:t:p:hlikvqnf:mgabcjo";
+const char * const short_options = "edyzsr:t:p:hlikvqnf:mgabcjoP:";
 
 #define OPT_AND_IMPL 1001
 
@@ -69,6 +69,7 @@ struct option long_options[] = {
 		{ "no-short-keywords", 0, NULL, 'b'},
 		{ "dedup-seg-filter-not-lookup", 0, NULL, 'j'},
 		{ "build-seg-bitmask", 0, NULL, 'o'},
+		{ "seg-files-per-seg", required_argument, NULL, 'P'},
 		{ "and-impl", required_argument, NULL, OPT_AND_IMPL },
 		{ NULL, 0, NULL, 0 }
 };
@@ -396,6 +397,7 @@ int main(int argc, char **argv) {
 	job = DESTOR_BACKUP;
 	int index_mode = INDEX_MODE_NO;
 	int revision = -1;
+	destor.seg_files_per_seg = 1024;   /* default segment size for -j / -o (-P overrides) */
 	sds tiny_dir = sdsnew(".");
 
 	sds path = NULL;
@@ -444,6 +446,10 @@ int main(int argc, char **argv) {
 		}
 		case 'o': {
 			job = DESTOR_BUILD_SEG_BITMASK;
+			break;
+		}
+		case 'P': {
+			destor.seg_files_per_seg = atoi(optarg);
 			break;
 		}
 		case 'k': {
@@ -626,12 +632,12 @@ int main(int argc, char **argv) {
 		break;
 	}
 	case DESTOR_DEDUPLICATED_NOT_LOOKUP_SEG_FILTER: {
-		std::string query = argv[2];
-		do_deduplicated_NOT_lookup_seg_filter(query);
+		std::string query = argv[optind];
+		do_deduplicated_NOT_lookup_seg_filter(query, destor.seg_files_per_seg);
 		break;
 	}
 	case DESTOR_BUILD_SEG_BITMASK:
-		saveSegmentBitmask(std::string(DEDUP_INDEX_DIR));
+		saveSegmentBitmask(std::string(DEDUP_INDEX_DIR), destor.seg_files_per_seg);
 		break;
 	case DESTOR_NAIVE_INDEX:
 		do_naive_index();

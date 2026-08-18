@@ -361,6 +361,9 @@ struct destor {
 	/* which AND algorithm to use for dedup lookups (AND_IMPL_*) */
 	uint32_t and_impl;
 
+	/* segment size (files per segment) for the segment bitmask filter (-P) */
+	int seg_files_per_seg;
+
 }; // DedupSearch
 
 extern struct destor destor; // DedupSearch
