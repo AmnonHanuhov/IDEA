@@ -164,12 +164,25 @@ class Experiment:
             self.kw_files = []
 
 
+def build_query(incl_terms, excl_terms) -> str:
+    """Build the Lucene query string for (all incl) AND NOT (any excl).
+
+    Included terms carry an explicit '+' (MUST).  This matters: Lucene's default
+    operator is OR, so an unmarked term parses as SHOULD (optional).  The naive
+    path hands the parsed query to Lucene and honours that, while the dedup path
+    intersects its included terms regardless -- so without the '+' the two
+    implementations answer different questions and their result counts diverge.
+    """
+    return (" ".join(f"+{t}" for t in incl_terms) + " "
+            + " ".join(f"-{t}" for t in excl_terms))
+
+
 def lucene_to_plain(query: str) -> str:
     """Convert a Lucene query string to plain English.
-    'foo bar -baz'  →  'foo AND bar NOT baz'
+    '+foo +bar -baz'  →  'foo AND bar NOT baz'
     """
     parts = query.split()
-    included = [p for p in parts if not p.startswith("-")]
+    included = [p.lstrip("+") for p in parts if not p.startswith("-")]
     excluded = [p.lstrip("-") for p in parts if p.startswith("-")]
     result = " AND ".join(included)
     if excluded:
@@ -286,7 +299,7 @@ def _build_not_experiments(include_naive: bool, kw_base: str) -> list:
         if not incl_terms or not excl_terms:
             print(f"  [skip] {regime_id}: missing keywords (run destor --kw-dataset <name> -z first)")
             return
-        query = " ".join(incl_terms) + " " + " ".join(f"-{t}" for t in excl_terms)
+        query = build_query(incl_terms, excl_terms)
         kw_files = (incl_files or []) + (excl_files or [])
         experiments.append(_not_experiment(regime_id, query, purpose, kw_files))
         experiments.append(_not_seg_experiment(regime_id, query, purpose, kw_files))
@@ -392,7 +405,7 @@ def _build_not_experiments_old(include_naive: bool, kw_base: str) -> list:
         if not incl_terms or not excl_terms:
             print(f"  [skip] {regime_id}: missing keywords")
             return
-        query = " ".join(incl_terms) + " " + " ".join(f"-{t}" for t in excl_terms)
+        query = build_query(incl_terms, excl_terms)
         kw_files_list = (incl_files or []) + (excl_files or [])
         experiments.append(_not_experiment(regime_id, query, purpose, kw_files_list))
         if include_naive:

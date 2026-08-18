@@ -960,7 +960,22 @@ IndexWriterPtr get_index_writer(const std::string& index_path) {
 	return writer;
 }
 
-std::vector<std::string> search_index(const std::string& query, const std::string& index, SyncQueue* queue) {	
+// The dedup NOT pipeline evaluates included terms conjunctively -- it has no
+// way to express "optional".  The parser keeps Lucene's standard OR default, so
+// a conjunctive query must mark its included terms MUST explicitly:
+//     +a +b +c -d        NOT        a b c -d
+// An unmarked term parses as SHOULD and would be intersected anyway, silently
+// answering a different query than the one asked; say so instead.  This is the
+// check that would have caught the naive/dedup mismatch in B2.
+static void warn_if_optional_clause(bool saw_optional) {
+	if (saw_optional) {
+		std::wcout << L"WARNING: query contains optional (SHOULD) clauses; the dedup "
+		           << L"NOT pipeline intersects all included terms, so the result "
+		           << L"corresponds to an AND query." << std::endl;
+	}
+}
+
+std::vector<std::string> search_index(const std::string& query, const std::string& index, SyncQueue* queue) {
 	BooleanQuery::setMaxClauseCount(std::numeric_limits<int32_t>::max());
 
 	QueryParserPtr parser = newLucene<QueryParser>(LuceneVersion::LUCENE_30,
@@ -983,6 +998,7 @@ std::vector<std::string> search_index_complex_query(const std::string& query, co
 	std::vector<std::vector<int32_t>> docBitmaps(parsedClauses.size());
 	std::vector<int32_t> included_terms;
 	std::vector<int32_t> excluded_terms;
+	bool saw_optional = false;
 	for (size_t i = 0; i < parsedClauses.size(); i++) {
 		String termText = boost::static_pointer_cast<TermQuery>(parsedClauses[i]->getQuery())->getTerm()->text();
 		uint16_t occur = parsedClauses[i]->getOccur();
@@ -990,11 +1006,13 @@ std::vector<std::string> search_index_complex_query(const std::string& query, co
 					   BooleanClause::SHOULD);
 		if (occur != BooleanClause::MUST_NOT) {
 			included_terms.push_back(i);
+			saw_optional |= (occur == BooleanClause::SHOULD);
 		} else {
 			excluded_terms.push_back(i);
 		}
 		std::wcout << "Term: " << termText << " Occur: " << occur << std::endl;
 	}
+	warn_if_optional_clause(saw_optional);
 	return search_query_in_index_not(new_query, included_terms, excluded_terms, index, &docBitmaps, queue);
 }
 
@@ -1012,14 +1030,20 @@ std::vector<std::string> search_index_complex_query_seg_filter(const std::string
 	BooleanQueryPtr new_query = newLucene<BooleanQuery>();
 	std::vector<std::vector<int32_t>> docBitmaps(parsedClauses.size());
 	std::vector<int32_t> included_terms, excluded_terms;
+	bool saw_optional = false;
 	for (size_t i = 0; i < parsedClauses.size(); i++) {
 		String termText = boost::static_pointer_cast<TermQuery>(parsedClauses[i]->getQuery())->getTerm()->text();
 		uint16_t occur = parsedClauses[i]->getOccur();
 		new_query->add(newLucene<TrackingTermQuery2>(newLucene<Term>(toWstring("data"), termText), i, &docBitmaps),
 		               BooleanClause::SHOULD);
-		if (occur != BooleanClause::MUST_NOT) included_terms.push_back(i);
-		else                                   excluded_terms.push_back(i);
+		if (occur != BooleanClause::MUST_NOT) {
+			included_terms.push_back(i);
+			saw_optional |= (occur == BooleanClause::SHOULD);
+		} else {
+			excluded_terms.push_back(i);
+		}
 	}
+	warn_if_optional_clause(saw_optional);
 
 	MyHitCollectorPtr collector = newLucene<MyHitCollector>(queue);
 	double doc_id_lookup_time = 0, doc_fetch_lookup_time = 0, seg_build_time = 0;
