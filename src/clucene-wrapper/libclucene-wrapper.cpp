@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -235,6 +236,20 @@ static const SegBitmask& loadSegmentBitmask(const std::string& index_path,
             // sizes its readahead window from the fault pattern alone, and a
             // format that interleaves two distant regions looks random to it.
             madvise(addr, (size_t)st.st_size, MADV_SEQUENTIAL);
+            // Lazily mapping the file means its I/O is paid by whichever phase
+            // first touches a page -- in practice the AND phase, whose reported
+            // time then mixes intersection work with bitmask reads and is not
+            // comparable between formats of different size.  When asked, fault
+            // the whole mapping in here instead, so the cost lands in the seg
+            // load timer where it can be seen.  Off by default: a query that
+            // touches few chunks should not read the whole file.
+            if (destor.seg_prefault) {
+                madvise(addr, (size_t)st.st_size, MADV_WILLNEED);
+                volatile uint8_t sink = 0;
+                const uint8_t* p = reinterpret_cast<const uint8_t*>(addr);
+                for (off_t off = 0; off < st.st_size; off += 4096) sink ^= p[off];
+                (void)sink;
+            }
             const uint64_t* h = reinterpret_cast<const uint64_t*>(addr);
             if (h[0] == SEG_BITMASK_MAGIC) {
                 sb.sparse        = false;
@@ -572,6 +587,17 @@ public:
 		size_t   seg_skips_not      = 0;   // excluded chunks skipped during NOT
 		size_t   excl_chunks_total  = 0;   // total excluded chunks (skip denominator)
 
+		// Major faults per phase.  With a lazily mapped segment index the disk
+		// reads show up as time inside whichever phase touches the page, not as
+		// load time, so report the faults alongside the timings to make clear
+		// how much of a phase was I/O rather than work.
+		auto majflt = []() -> long {
+			struct rusage ru;
+			getrusage(RUSAGE_SELF, &ru);
+			return ru.ru_majflt;
+		};
+		long majflt_and = 0, majflt_not = 0;
+
 		// --- matchTracker size accounting ---
 		size_t matchTracker_total_bytes = sizeof(*matchTracker);
 		matchTracker_total_bytes += matchTracker->capacity() * sizeof(std::vector<int32_t>);
@@ -672,6 +698,7 @@ public:
 		};
 
 		// --- AND (Count-Advancing) over INCLUDED terms ---
+		majflt_and = majflt();
 		TIMER_BEGIN(2);
 
 		const int32_t numIncluded = (int32_t)sorted_termIDs_by_matches.size();
@@ -745,12 +772,14 @@ public:
 		fileState.collectResultsInt32((uint16_t)numIncluded, candidates);
 
 		TIMER_END(2, total_and_time);   // AND (intersection) phase ends here
+		majflt_and = majflt() - majflt_and;
 
 		if (candidates.empty()) {
 			return results;             // nothing survived AND; NOT phase not run
 		}
 
 		// --- NOT filter: kill any AND-survivor that appears in excluded terms ---
+		majflt_not = majflt();
 		TIMER_BEGIN(4);
 		size_t alive = candidates.size();
 
@@ -813,6 +842,7 @@ public:
 		}
 
 		TIMER_END(4, total_not_time);   // NOT filter + gather phase ends here
+		majflt_not = majflt() - majflt_not;
 
 		// --- Optional stats ---
 		std::cout << "Unique chunks fetched: " << num_chunks_fetched
@@ -838,6 +868,8 @@ public:
 			printf("Seg filter skip pct: %.2f\n", skip_pct);
 			printf("Seg filter AND skip pct: %.2f\n", and_skip_pct);
 		}
+		printf("AND major faults: %ld\n", majflt_and);
+		printf("NOT major faults: %ld\n", majflt_not);
 		printf("Sorting included terms time: %.3f\n", total_sorting_keywords_time / 1000000.0);
 		printf("AND evaluation time: %.3f\n", total_and_time / 1000000.0);
 		printf("NOT evaluation time: %.3f\n", total_not_time / 1000000.0);

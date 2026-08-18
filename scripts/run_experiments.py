@@ -620,6 +620,8 @@ class RunResult:
     seg_skip_pct: Optional[float] = None      # seg_skips_not / excl chunks total (%)
     unique_chunks_fetched: Optional[int] = None  # chunks whose file list was fetched
     and_not_eval_time: Optional[float] = None    # AND+NOT in-memory phase (getResults...)
+    and_majflt: Optional[int] = None          # major (disk) faults during the AND phase
+    not_majflt: Optional[int] = None          # major (disk) faults during the NOT phase
     # Metadata for graphing/reporting
     query_plain: str = ""
     purpose: str = ""
@@ -649,6 +651,8 @@ _TIME_PATTERNS = [
     ("excl_chunks_total",   r"Excluded chunks total:\s*(\d+)"),
     ("unique_chunks_fetched", r"Unique chunks fetched:\s*(\d+)"),
     ("and_not_eval_time",   r"AND\+NOT evaluation time:\s*([\d.]+)"),
+    ("and_majflt",          r"AND major faults:\s*(\d+)"),
+    ("not_majflt",          r"NOT major faults:\s*(\d+)"),
     ("not_killed",          r"NOT killed:\s*(\d+)"),
     ("excl_chunk_count",    r"Excluded chunk count:\s*(\d+)"),
 ]
@@ -658,7 +662,7 @@ def parse_output(stdout: str) -> dict:
     result = {}
     int_keys = {"num_results", "and_candidates", "opt1_skips", "seg_filter_skips", "not_killed",
                 "excl_chunk_count", "seg_skips_and", "seg_skips_not", "candidate_segments",
-                "excl_chunks_total", "unique_chunks_fetched"}
+                "excl_chunks_total", "unique_chunks_fetched", "and_majflt", "not_majflt"}
     for key, pat in _TIME_PATTERNS:
         m = re.search(pat, stdout, re.IGNORECASE)
         if m:
@@ -741,6 +745,8 @@ def run_one(exp: Experiment, rep: int, do_clear: bool) -> RunResult:
     r.candidate_segments  = parsed.get("candidate_segments")
     r.unique_chunks_fetched = parsed.get("unique_chunks_fetched")
     r.and_not_eval_time   = parsed.get("and_not_eval_time")
+    r.and_majflt          = parsed.get("and_majflt")
+    r.not_majflt          = parsed.get("not_majflt")
     r.seg_load_time       = parsed.get("seg_load_time")
     r.dtor_time           = parsed.get("dtor_time")
     return r
@@ -818,6 +824,8 @@ def aggregate(results: list) -> dict:
             "avg_seg_skips_and":       comp_avg("seg_skips_and"),
             "avg_seg_skip_pct":        comp_avg("seg_skip_pct"),
             "avg_unique_chunks_fetched": comp_avg("unique_chunks_fetched"),
+            "avg_and_majflt":          comp_avg("and_majflt"),
+            "avg_not_majflt":          comp_avg("not_majflt"),
             # Optimization diagnostics (averages across reps; dedup only)
             "avg_and_candidates":      comp_avg("and_candidates"),
             "avg_opt1_skips":          comp_avg("opt1_skips"),

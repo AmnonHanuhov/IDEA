@@ -367,6 +367,9 @@ struct destor {
 	/* use the sparse (sorted segment-id list) representation instead of dense (-S) */
 	bool seg_sparse;
 
+	/* fault the whole segment index in at load time instead of lazily (-W) */
+	bool seg_prefault;
+
 }; // DedupSearch
 
 extern struct destor destor; // DedupSearch

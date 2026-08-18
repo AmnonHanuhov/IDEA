@@ -44,7 +44,7 @@ int job;
 /* : means argument is required.
  * :: means argument is optional.
  */
-const char * const short_options = "edyzsr:t:p:hlikvqnf:mgabcjoP:S";
+const char * const short_options = "edyzsr:t:p:hlikvqnf:mgabcjoP:SW";
 
 #define OPT_AND_IMPL 1001
 
@@ -71,6 +71,7 @@ struct option long_options[] = {
 		{ "build-seg-bitmask", 0, NULL, 'o'},
 		{ "seg-files-per-seg", required_argument, NULL, 'P'},
 		{ "seg-sparse", 0, NULL, 'S'},
+		{ "seg-prefault", 0, NULL, 'W'},
 		{ "and-impl", required_argument, NULL, OPT_AND_IMPL },
 		{ NULL, 0, NULL, 0 }
 };
@@ -400,6 +401,7 @@ int main(int argc, char **argv) {
 	int revision = -1;
 	destor.seg_files_per_seg = 1024;   /* default segment size for -j / -o (-P overrides) */
 	destor.seg_sparse = false;         /* dense by default; -S selects sparse */
+	destor.seg_prefault = false;       /* lazy by default; -W prefaults at load */
 	sds tiny_dir = sdsnew(".");
 
 	sds path = NULL;
@@ -456,6 +458,10 @@ int main(int argc, char **argv) {
 		}
 		case 'S': {
 			destor.seg_sparse = true;
+			break;
+		}
+		case 'W': {
+			destor.seg_prefault = true;
 			break;
 		}
 		case 'k': {
