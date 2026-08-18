@@ -1109,6 +1109,10 @@ void do_deduplicated_NOT_lookup_seg_filter(const std::string& query, int files_p
 	std::set<std::string> found_in_files = resolve_file_ids(file_ids);
 	TIMER_END(3, indirection_time);
 	TIMER_END(1, total_lookup_time);
+	FILE* results_file = fopen("dedup_lookup_results.out", "wb");
+	for (const std::string& result : found_in_files)
+		fprintf(results_file, "found result: %s\n", result.c_str());
+	fclose(results_file);
 	total_lookup_time /= 1000000;
 	index_lookup_time /= 1000000;
 	indirection_time  /= 1000000;
