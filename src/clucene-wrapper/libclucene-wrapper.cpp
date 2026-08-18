@@ -561,7 +561,8 @@ public:
 
 		uint32_t num_files_fetched  = 0;
 		uint32_t num_chunks_fetched = 0;
-		size_t   seg_filter_skips   = 0;
+		size_t   seg_skips_and      = 0;   // included chunks skipped during AND
+		size_t   seg_skips_not      = 0;   // excluded chunks skipped during NOT
 
 		// --- matchTracker size accounting ---
 		size_t matchTracker_total_bytes = sizeof(*matchTracker);
@@ -613,6 +614,45 @@ public:
 			return inserted.first->second;
 		};
 
+		// --- Segment-filter working state (dense multi-word OR sparse lists) ---
+		const bool segFilter = (seg_bitmask != nullptr);
+		const bool segSparse = segFilter && seg_bitmask->sparse;
+		const int  segW      = (segFilter && !segSparse) ? seg_bitmask->words : 0;
+		const int  segFPS    = segFilter ? seg_bitmask->files_per_seg
+		                                 : (int)DEFAULT_FILES_PER_SEG;
+		// Current candidate segment-set (dense mask or sorted id-list), plus a
+		// per-term accumulator of the segments of files that (re)entered the set.
+		std::vector<uint64_t> cand_mask, acc_mask;   // dense
+		std::vector<uint16_t> cand_segs, acc_raw;    // sparse (cand sorted-unique)
+		auto accSeg = [&](int32_t fid) {
+			uint32_t seg = (uint32_t)fid / (uint32_t)segFPS;
+			if (segSparse) acc_raw.push_back((uint16_t)seg);
+			else           acc_mask[seg >> 6] |= (1ULL << (seg & 63));
+		};
+		auto resetAcc = [&]() {
+			if (segSparse) acc_raw.clear();
+			else           acc_mask.assign(segW, 0ULL);
+		};
+		auto finalizeCandidate = [&]() {   // candidate := accumulator
+			if (segSparse) {
+				std::sort(acc_raw.begin(), acc_raw.end());
+				acc_raw.erase(std::unique(acc_raw.begin(), acc_raw.end()), acc_raw.end());
+				cand_segs.swap(acc_raw);
+			} else {
+				cand_mask.swap(acc_mask);
+			}
+		};
+		// true iff chunkID's segments do not overlap the current candidate => skip.
+		auto segDisjoint = [&](int32_t chunkID) -> bool {
+			if (chunkID < 0 || (size_t)chunkID >= seg_bitmask->size()) return false;
+			if (segSparse)
+				return segListsDisjoint(seg_bitmask->segBegin(chunkID), seg_bitmask->segEnd(chunkID),
+				                        cand_segs.data(), cand_segs.data() + cand_segs.size());
+			const uint64_t* r = seg_bitmask->row(chunkID);
+			for (int w = 0; w < segW; ++w) if (r[w] & cand_mask[w]) return false;
+			return true;
+		};
+
 		// --- AND (Count-Advancing) over INCLUDED terms ---
 		TIMER_BEGIN(2);
 
@@ -626,19 +666,33 @@ public:
 		for (int32_t termIndex = 0; termIndex < numIncluded; ++termIndex) {
 			int32_t termId = sorted_termIDs_by_matches[termIndex];
 			size_t advancedThisTerm = 0;
+			if (segFilter) resetAcc();   // accumulate this term's candidate segments
 
 			const auto& chunksForTerm = (*matchTracker)[termId];
 			for (size_t ci = 0; ci < chunksForTerm.size(); ++ci) {
 				int32_t chunkID = chunksForTerm[ci];
-				const std::vector<int32_t>& files = get_files_for_chunk(chunkID);
 
 				if (termIndex == 0) {
+					// Seed the intersection from the smallest term and record
+					// the segments its files span.
+					const std::vector<int32_t>& files = get_files_for_chunk(chunkID);
 					for (size_t fi = 0; fi < files.size(); ++fi) {
 						int32_t fid = files[fi];
 						uint16_t& cnt = fileState.getOrCreate(fid);
-						if (cnt == 0) cnt = 1;
+						if (cnt == 0) {
+							cnt = 1;
+							if (segFilter) accSeg(fid);
+						}
 					}
 				} else {
+					// Early exit: if none of this chunk's segments overlap the
+					// current intersection, no file of it can be a candidate,
+					// so skip it without fetching its file list.
+					if (segFilter && segDisjoint(chunkID)) {
+						++seg_skips_and;
+						continue;
+					}
+					const std::vector<int32_t>& files = get_files_for_chunk(chunkID);
 					for (size_t fi = 0; fi < files.size(); ++fi) {
 						int32_t fid = files[fi];
 						uint16_t* cntPtr = fileState.getIfExists(fid);
@@ -646,11 +700,15 @@ public:
 						if (*cntPtr == (uint16_t)termIndex) {
 							*cntPtr = (uint16_t)(termIndex + 1);
 							++advancedThisTerm;
+							if (segFilter) accSeg(fid);
 						}
 					}
 				}
 			}
 
+			// The intersection just shrank to the files that (re)entered it;
+			// tighten the candidate to their segments for the next term / NOT.
+			if (segFilter) finalizeCandidate();
 			if (termIndex > 0 && advancedThisTerm == 0) {
 				no_common_files = true;
 				break;
@@ -676,42 +734,9 @@ public:
 		// --- NOT filter: kill any AND-survivor that appears in excluded terms ---
 		size_t alive = candidates.size();
 
-		// Segment filter: candidate_mask has bit s set iff any candidate file is in
-		// segment s.  At fine granularities the segment count exceeds 64, so the
-		// mask spans the same `words` 64-bit words as a chunk's row.
-		// An excluded chunk can be skipped entirely if none of its segments overlap.
-		const bool segFilter = (seg_bitmask != nullptr);
-		const bool segSparse = segFilter && seg_bitmask->sparse;
-		const int  segW      = (segFilter && !segSparse) ? seg_bitmask->words : 0;
-		const int  segFPS    = segFilter ? seg_bitmask->files_per_seg
-		                                 : (int)DEFAULT_FILES_PER_SEG;
-		std::vector<uint64_t> candidate_mask;   // dense
-		std::vector<uint16_t> cand_segs;        // sparse (sorted-unique segment ids)
-		if (segFilter) {
-			if (segSparse) {
-				cand_segs.reserve(candidates.size());
-				for (int32_t fid : candidates)
-					cand_segs.push_back((uint16_t)((uint32_t)fid / (uint32_t)segFPS));
-				std::sort(cand_segs.begin(), cand_segs.end());
-				cand_segs.erase(std::unique(cand_segs.begin(), cand_segs.end()), cand_segs.end());
-			} else {
-				candidate_mask.assign(segW, 0ULL);
-				for (int32_t fid : candidates) {
-					uint32_t seg = (uint32_t)fid / (uint32_t)segFPS;
-					candidate_mask[seg >> 6] |= (1ULL << (seg & 63));
-				}
-			}
-		}
-		// true iff chunkID's segments do not overlap the candidate set => skip.
-		auto segDisjoint = [&](int32_t chunkID) -> bool {
-			if (chunkID < 0 || (size_t)chunkID >= seg_bitmask->size()) return false;
-			if (segSparse)
-				return segListsDisjoint(seg_bitmask->segBegin(chunkID), seg_bitmask->segEnd(chunkID),
-				                        cand_segs.data(), cand_segs.data() + cand_segs.size());
-			const uint64_t* r = seg_bitmask->row(chunkID);
-			for (int w = 0; w < segW; ++w) if (r[w] & candidate_mask[w]) return false;
-			return true;
-		};
+		// The candidate segment-set already reflects the AND survivors, having
+		// been narrowed alongside the intersection above.  An excluded chunk can
+		// be skipped entirely if none of its segments overlap it.
 
 		for (size_t ei = 0; ei < excluded_terms.size(); ++ei) {
 			const int32_t exTermId = excluded_terms[ei];
@@ -721,7 +746,7 @@ public:
 				const int32_t chunkID = exChunksForTerm[ci];
 
 				if (segFilter && segDisjoint(chunkID)) {
-					++seg_filter_skips;
+					++seg_skips_not;
 					continue;
 				}
 
@@ -765,8 +790,11 @@ public:
 				<< ", chunkToFiles buckets: " << chunkToFiles.bucket_count()
 				<< std::endl;
 
-		if (seg_filter_skips > 0)
-			printf("Seg filter skips: %zu\n", seg_filter_skips);
+		if (seg_bitmask != nullptr) {
+			printf("Seg filter skips: %zu\n", seg_skips_and + seg_skips_not);
+			printf("Seg filter skips AND: %zu\n", seg_skips_and);
+			printf("Seg filter skips NOT: %zu\n", seg_skips_not);
+		}
 		printf("Sorting included terms time: %.3f\n", total_sorting_keywords_time / 1000000.0);
 		printf("AND+NOT evaluation time: %.3f\n", total_intersection_time / 1000000.0);
 		printf("Fetch files time: %.3f\n", total_fetch_files_time / 1000000.0);
