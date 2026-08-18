@@ -230,6 +230,11 @@ static const SegBitmask& loadSegmentBitmask(const std::string& index_path,
     if (fstat(fd, &st) == 0 && st.st_size > (off_t)(4 * sizeof(uint64_t))) {
         void* addr = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
         if (addr != MAP_FAILED) {
+            // Both phases walk chunk ids in ascending order, so the mapping is
+            // read as a forward stream.  Say so: without the hint the kernel
+            // sizes its readahead window from the fault pattern alone, and a
+            // format that interleaves two distant regions looks random to it.
+            madvise(addr, (size_t)st.st_size, MADV_SEQUENTIAL);
             const uint64_t* h = reinterpret_cast<const uint64_t*>(addr);
             if (h[0] == SEG_BITMASK_MAGIC) {
                 sb.sparse        = false;
