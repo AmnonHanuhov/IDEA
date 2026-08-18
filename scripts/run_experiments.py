@@ -505,6 +505,15 @@ class RunResult:
     excl_chunks_total: Optional[int] = None   # total excluded chunks (denominator)
     seg_filter_skips: Optional[int] = None    # excluded chunks skipped by segment filter
     seg_build_time: Optional[float] = None    # time to build the segment bitmask
+    seg_load_time: Optional[float] = None     # time to load the segment bitmask (dedup+seg)
+    dtor_time: Optional[float] = None         # index destructor / close time
+    # Segment-filter diagnostics (dedup+seg only)
+    candidate_segments: Optional[int] = None  # #segments the AND survivors span (mask popcount)
+    seg_skips_and: Optional[int] = None       # included chunks skipped during AND phase
+    seg_skips_not: Optional[int] = None       # excluded chunks skipped during NOT phase
+    seg_skip_pct: Optional[float] = None      # seg_skips_not / excl chunks total (%)
+    unique_chunks_fetched: Optional[int] = None  # chunks whose file list was fetched
+    and_not_eval_time: Optional[float] = None    # AND+NOT in-memory phase (getResults...)
     # Metadata for graphing/reporting
     query_plain: str = ""
     purpose: str = ""
@@ -516,6 +525,8 @@ class RunResult:
 _TIME_PATTERNS = [
     ("searcher_load_time",  r"searcher load time:\s*([\d.]+)"),
     ("seg_build_time",      r"seg filter build time:\s*([\d.]+)"),
+    ("seg_load_time",       r"seg filter load time:\s*([\d.]+)"),
+    ("dtor_time",           r"destructors' time:\s*([\d.]+)"),
     ("doc_lookup_time",     r"doc lookup time:\s*([\d.]+)"),
     ("and_eval_time",       r"AND evaluation time:\s*([\d.]+)"),
     ("not_eval_time",       r"NOT evaluation time:\s*([\d.]+)"),
@@ -525,6 +536,13 @@ _TIME_PATTERNS = [
     ("and_candidates",      r"AND candidates:\s*(\d+)"),
     ("opt1_skips",          r"Opt1 skips:\s*(\d+)"),
     ("seg_filter_skips",    r"Seg filter skips:\s*(\d+)"),
+    ("seg_skips_and",       r"Seg filter skips AND:\s*(\d+)"),
+    ("seg_skips_not",       r"Seg filter skips NOT:\s*(\d+)"),
+    ("seg_skip_pct",        r"Seg filter skip pct:\s*([\d.]+)"),
+    ("candidate_segments",  r"Candidate segments:\s*(-?\d+)"),
+    ("excl_chunks_total",   r"Excluded chunks total:\s*(\d+)"),
+    ("unique_chunks_fetched", r"Unique chunks fetched:\s*(\d+)"),
+    ("and_not_eval_time",   r"AND\+NOT evaluation time:\s*([\d.]+)"),
     ("not_killed",          r"NOT killed:\s*(\d+)"),
     ("excl_chunk_count",    r"Excluded chunk count:\s*(\d+)"),
 ]
@@ -532,7 +550,9 @@ _TIME_PATTERNS = [
 
 def parse_output(stdout: str) -> dict:
     result = {}
-    int_keys = {"num_results", "and_candidates", "opt1_skips", "seg_filter_skips", "not_killed", "excl_chunk_count"}
+    int_keys = {"num_results", "and_candidates", "opt1_skips", "seg_filter_skips", "not_killed",
+                "excl_chunk_count", "seg_skips_and", "seg_skips_not", "candidate_segments",
+                "excl_chunks_total", "unique_chunks_fetched"}
     for key, pat in _TIME_PATTERNS:
         m = re.search(pat, stdout, re.IGNORECASE)
         if m:
@@ -558,8 +578,9 @@ def parse_output(stdout: str) -> dict:
     ae  = result.get("and_eval_time",       0.0)
     ne  = result.get("not_eval_time",       0.0)
     gr  = result.get("gather_results_time", 0.0)
+    ane = result.get("and_not_eval_time",   0.0)   # combined AND+NOT phase (current impl)
     ff  = result.get("fetch_files_time",    0.0)
-    dedup_phase = ae + ne + gr
+    dedup_phase = ae + ne + gr + ane
     if sl or dl or dedup_phase or ff:
         result["total_time"] = sl + sb + dl + (dedup_phase if dedup_phase else ff)
 
@@ -607,6 +628,15 @@ def run_one(exp: Experiment, rep: int, do_clear: bool) -> RunResult:
     r.not_killed          = parsed.get("not_killed")
     r.excl_chunks_scanned = parsed.get("excl_chunks_scanned")
     r.excl_chunks_total   = parsed.get("excl_chunks_total")
+    r.seg_filter_skips    = parsed.get("seg_filter_skips")
+    r.seg_skips_and       = parsed.get("seg_skips_and")
+    r.seg_skips_not       = parsed.get("seg_skips_not")
+    r.seg_skip_pct        = parsed.get("seg_skip_pct")
+    r.candidate_segments  = parsed.get("candidate_segments")
+    r.unique_chunks_fetched = parsed.get("unique_chunks_fetched")
+    r.and_not_eval_time   = parsed.get("and_not_eval_time")
+    r.seg_load_time       = parsed.get("seg_load_time")
+    r.dtor_time           = parsed.get("dtor_time")
     return r
 
 
@@ -668,11 +698,20 @@ def aggregate(results: list) -> dict:
             # Component averages for graphing
             "avg_searcher_load":    comp_avg("searcher_load_time"),
             "avg_seg_build":        comp_avg("seg_build_time"),
+            "avg_seg_load":         comp_avg("seg_load_time"),
+            "avg_dtor":             comp_avg("dtor_time"),
             "avg_doc_lookup":       comp_avg("doc_lookup_time"),
             "avg_and_eval":         comp_avg("and_eval_time"),
             "avg_not_eval":         comp_avg("not_eval_time"),
+            "avg_and_not_eval":     comp_avg("and_not_eval_time"),
             "avg_gather_results":   comp_avg("gather_results_time"),
             "avg_fetch_files":      comp_avg("fetch_files_time"),
+            # Segment-filter diagnostics (dedup+seg only)
+            "avg_candidate_segments":  comp_avg("candidate_segments"),
+            "avg_seg_skips_not":       comp_avg("seg_skips_not"),
+            "avg_seg_skips_and":       comp_avg("seg_skips_and"),
+            "avg_seg_skip_pct":        comp_avg("seg_skip_pct"),
+            "avg_unique_chunks_fetched": comp_avg("unique_chunks_fetched"),
             # Optimization diagnostics (averages across reps; dedup only)
             "avg_and_candidates":      comp_avg("and_candidates"),
             "avg_opt1_skips":          comp_avg("opt1_skips"),
@@ -787,23 +826,24 @@ def print_diagnostics_table(agg: dict, suite_name: str):
 # Graphs
 # ---------------------------------------------------------------------------
 
-# Per-implementation component stacks (bottom → top).
-# Dedup and naive share the first two segments; the third differs.
+# Per-implementation component stacks (bottom → top).  Labels match the
+# timings the current AND+NOT implementation actually emits:
+#   searcher load → [seg filter load] → doc lookup (Lucene term search) →
+#   AND+NOT evaluation (in-memory intersection + NOT, incl. file-list fetch) →
+#   index close (destructors).
 _DEDUP_COMPONENTS = [
     ("avg_searcher_load",  "#4C72B0", "Searcher Load"),
     ("avg_doc_lookup",     "#DD8452", "Doc Lookup (Lucene)"),
     ("avg_and_eval",       "#55A868", "AND Evaluation"),
     ("avg_not_eval",       "#8172B3", "NOT Evaluation"),
-    ("avg_gather_results", "#64B5CD", "Gather Results"),
 ]
-# dedup+seg adds the bitmask build time but otherwise uses the same phases
+# dedup+seg adds the one-time bitmask load but otherwise uses the same phases
 _DEDUP_SEG_COMPONENTS = [
     ("avg_searcher_load",  "#4C72B0", "Searcher Load"),
-    ("avg_seg_build",      "#E09020", "Seg Filter Build"),
+    ("avg_seg_load",       "#E09020", "Seg Filter Load"),
     ("avg_doc_lookup",     "#DD8452", "Doc Lookup (Lucene)"),
     ("avg_and_eval",       "#55A868", "AND Evaluation"),
     ("avg_not_eval",       "#8172B3", "NOT Evaluation"),
-    ("avg_gather_results", "#64B5CD", "Gather Results"),
 ]
 _NAIVE_COMPONENTS = [
     ("avg_searcher_load", "#4C72B0", "Searcher Load"),

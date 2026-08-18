@@ -551,9 +551,11 @@ public:
 		TIMER_DECLARE(1);
 		TIMER_DECLARE(2);
 		TIMER_DECLARE(3);
+		TIMER_DECLARE(4);
 
 		double total_sorting_keywords_time = 0;
-		double total_intersection_time     = 0;
+		double total_and_time              = 0;   // count-advancing AND intersection
+		double total_not_time              = 0;   // NOT filter + result gathering
 		double total_fetch_files_time      = 0;
 
 		std::vector<std::string> results;
@@ -563,6 +565,7 @@ public:
 		uint32_t num_chunks_fetched = 0;
 		size_t   seg_skips_and      = 0;   // included chunks skipped during AND
 		size_t   seg_skips_not      = 0;   // excluded chunks skipped during NOT
+		size_t   excl_chunks_total  = 0;   // total excluded chunks (skip denominator)
 
 		// --- matchTracker size accounting ---
 		size_t matchTracker_total_bytes = sizeof(*matchTracker);
@@ -580,6 +583,16 @@ public:
 					return (*matchTracker)[t1].size() < (*matchTracker)[t2].size();
 				});
 		TIMER_END(1, total_sorting_keywords_time);
+
+		// Included-chunk accounting: total posting size across included terms, and
+		// the AND-skip denominator (chunks in every term after the seed term 0,
+		// which are the ones actually subject to the AND-phase skip test).
+		size_t included_chunks_total = 0, and_eligible_chunks = 0;
+		for (size_t i = 0; i < sorted_termIDs_by_matches.size(); ++i) {
+			size_t n = (*matchTracker)[sorted_termIDs_by_matches[i]].size();
+			included_chunks_total += n;
+			if (i > 0) and_eligible_chunks += n;
+		}
 
 		static const std::wstring nameField = toWstring("name");
 
@@ -659,7 +672,7 @@ public:
 		const int32_t numIncluded = (int32_t)sorted_termIDs_by_matches.size();
 		if (numIncluded == 0) {
 			// Pure NOT is undefined without a universe of all files.
-			TIMER_END(2, total_intersection_time);
+			TIMER_END(2, total_and_time);
 			return results;
 		}
 
@@ -717,7 +730,7 @@ public:
 
 		// If AND already empty -> done
 		if (no_common_files) {
-			TIMER_END(2, total_intersection_time);
+			TIMER_END(2, total_and_time);
 			return results;
 		}
 
@@ -726,21 +739,35 @@ public:
 		candidates.reserve(1024); // optional
 		fileState.collectResultsInt32((uint16_t)numIncluded, candidates);
 
+		TIMER_END(2, total_and_time);   // AND (intersection) phase ends here
+
 		if (candidates.empty()) {
-			TIMER_END(2, total_intersection_time);
-			return results;
+			return results;             // nothing survived AND; NOT phase not run
 		}
 
 		// --- NOT filter: kill any AND-survivor that appears in excluded terms ---
+		TIMER_BEGIN(4);
 		size_t alive = candidates.size();
 
-		// The candidate segment-set already reflects the AND survivors, having
-		// been narrowed alongside the intersection above.  An excluded chunk can
-		// be skipped entirely if none of its segments overlap it.
+		// candidate_mask already reflects the segments of the AND survivors,
+		// having been narrowed alongside the intersection above. An excluded
+		// chunk can be skipped entirely if none of its segments overlap it.
+		// The popcount is the segment locality of the survivors: the fewer
+		// segments they span, the more excluded chunks the filter can skip.
+		int candidate_segments = -1;
+		if (segFilter) {
+			if (segSparse) candidate_segments = (int)cand_segs.size();
+			else {
+				candidate_segments = 0;
+				for (int w = 0; w < segW; ++w)
+					candidate_segments += __builtin_popcountll(cand_mask[w]);
+			}
+		}
 
 		for (size_t ei = 0; ei < excluded_terms.size(); ++ei) {
 			const int32_t exTermId = excluded_terms[ei];
 			const auto& exChunksForTerm = (*matchTracker)[exTermId];
+			excl_chunks_total += exChunksForTerm.size();
 
 			for (size_t ci = 0; ci < exChunksForTerm.size(); ++ci) {
 				const int32_t chunkID = exChunksForTerm[ci];
@@ -780,7 +807,7 @@ public:
 			}
 		}
 
-		TIMER_END(2, total_intersection_time);
+		TIMER_END(4, total_not_time);   // NOT filter + gather phase ends here
 
 		// --- Optional stats ---
 		std::cout << "Unique chunks fetched: " << num_chunks_fetched
@@ -791,12 +818,25 @@ public:
 				<< std::endl;
 
 		if (seg_bitmask != nullptr) {
-			printf("Seg filter skips: %zu\n", seg_skips_and + seg_skips_not);
+			size_t seg_filter_skips = seg_skips_and + seg_skips_not;
+			double skip_pct = excl_chunks_total ? 100.0 * seg_skips_not / excl_chunks_total : 0.0;
+			double and_skip_pct = and_eligible_chunks ? 100.0 * seg_skips_and / and_eligible_chunks : 0.0;
+			printf("Candidate segments: %d\n", candidate_segments);
+			printf("Segment format: %s, words: %d, files/seg: %d\n",
+			       segSparse ? "sparse" : "dense", segW, segFPS);
+			printf("Included chunks total: %zu\n", included_chunks_total);
+			printf("AND-eligible chunks: %zu\n", and_eligible_chunks);
+			printf("Excluded chunks total: %zu\n", excl_chunks_total);
+			printf("Seg filter skips: %zu\n", seg_filter_skips);
 			printf("Seg filter skips AND: %zu\n", seg_skips_and);
 			printf("Seg filter skips NOT: %zu\n", seg_skips_not);
+			printf("Seg filter skip pct: %.2f\n", skip_pct);
+			printf("Seg filter AND skip pct: %.2f\n", and_skip_pct);
 		}
 		printf("Sorting included terms time: %.3f\n", total_sorting_keywords_time / 1000000.0);
-		printf("AND+NOT evaluation time: %.3f\n", total_intersection_time / 1000000.0);
+		printf("AND evaluation time: %.3f\n", total_and_time / 1000000.0);
+		printf("NOT evaluation time: %.3f\n", total_not_time / 1000000.0);
+		printf("AND+NOT evaluation time: %.3f\n", (total_and_time + total_not_time) / 1000000.0);
 		printf("Fetch files time: %.3f\n", total_fetch_files_time / 1000000.0);
 
 		return results;
