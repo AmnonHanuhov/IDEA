@@ -53,9 +53,17 @@ echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/<path_to_idea>/IDEA/boost_1_58_0/
 ### compile
 RUN this from the IDEA repository to compile the code.
 ```
+# fetch the pinned lucene++ checkout (first time only)
+git submodule update --init
+
 chmod +x compile.sh
 ./compile.sh
 ```
+Lucene++ is a submodule pinned to an unmodified upstream commit. The changes
+this project needs -- the `TrackingTerm*` scorers the dedup lookup paths depend
+on, plus a boost-compat fix -- live in `patches/lucene++-tracking-scorers.patch`
+and are applied to that checkout by `compile.sh` (via
+`scripts/apply_lucene_patch.sh`, which is a no-op if they are already applied).
 # Note #
 if the compile.sh finished with no errors and while running destor you receive libboost not found, try adding /usr/local/bin to the system path:
 ```

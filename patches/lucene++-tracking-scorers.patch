@@ -1,0 +1,728 @@
+diff --git a/include/lucene++/BooleanScorer.h b/include/lucene++/BooleanScorer.h
+index 9009e19..876d9e6 100644
+--- a/include/lucene++/BooleanScorer.h
++++ b/include/lucene++/BooleanScorer.h
+@@ -59,6 +59,7 @@ public:
+     virtual int32_t nextDoc();
+     virtual double score();
+     virtual void score(const CollectorPtr& collector);
++    void setDocBase(int32_t docBase) override;
+     virtual String toString();
+ 
+ };
+diff --git a/include/lucene++/BooleanScorer2.h b/include/lucene++/BooleanScorer2.h
+index b4f4bbc..60ecdbb 100644
+--- a/include/lucene++/BooleanScorer2.h
++++ b/include/lucene++/BooleanScorer2.h
+@@ -34,6 +34,9 @@ public:
+ 
+     virtual ~BooleanScorer2();
+ 
++    void setDocBase(int32_t docBase) override;
++
++
+     LUCENE_CLASS(BooleanScorer2);
+ 
+ protected:
+diff --git a/include/lucene++/LuceneTypes.h b/include/lucene++/LuceneTypes.h
+index 2a1f03e..af05a5f 100644
+--- a/include/lucene++/LuceneTypes.h
++++ b/include/lucene++/LuceneTypes.h
+@@ -461,6 +461,10 @@ DECLARE_SHARED_PTR(StringIndex)
+ DECLARE_SHARED_PTR(StringIndexCache)
+ DECLARE_SHARED_PTR(SubScorer)
+ DECLARE_SHARED_PTR(TermQuery)
++DECLARE_SHARED_PTR(TrackingTermQuery)
++DECLARE_SHARED_PTR(TrackingTermQuery2)
++DECLARE_SHARED_PTR(TrackingTermScorer)
++DECLARE_SHARED_PTR(TrackingTermScorer2)
+ DECLARE_SHARED_PTR(TermRangeFilter)
+ DECLARE_SHARED_PTR(TermRangeQuery)
+ DECLARE_SHARED_PTR(TermRangeTermEnum)
+diff --git a/include/lucene++/Scorer.h b/include/lucene++/Scorer.h
+index 181ac39..514c50f 100644
+--- a/include/lucene++/Scorer.h
++++ b/include/lucene++/Scorer.h
+@@ -37,6 +37,7 @@ public:
+     Scorer(const SimilarityPtr& similarity);
+     Scorer(const WeightPtr& weight);
+     virtual ~Scorer();
++    virtual void setDocBase(int32_t docBase);
+ 
+     LUCENE_CLASS(Scorer);
+     WeightPtr weight;
+diff --git a/include/lucene++/TrackingTermQuery.h b/include/lucene++/TrackingTermQuery.h
+new file mode 100644
+index 0000000..8367639
+--- /dev/null
++++ b/include/lucene++/TrackingTermQuery.h
+@@ -0,0 +1,29 @@
++#ifndef TRACKINGTERMQUERY_H
++#define TRACKINGTERMQUERY_H
++
++#include <unordered_map>
++#include "TermQuery.h"
++#include "boost/dynamic_bitset.hpp"
++
++namespace Lucene {
++
++class LPPAPI TrackingTermQuery : public TermQuery {
++public:
++    TrackingTermQuery(const TermPtr& term, size_t bitIndex, size_t num_terms,
++                      std::unordered_map<int32_t, boost::dynamic_bitset<>>* matchTracker);
++    virtual ~TrackingTermQuery();
++    virtual WeightPtr createWeight(const SearcherPtr& searcher) override;
++    virtual QueryPtr rewrite(const IndexReaderPtr& reader) override;
++
++    friend class TrackingTermWeight;
++    friend class TermWeight;  
++
++private:
++    size_t bitIndex;
++    size_t num_terms;
++    std::unordered_map<int32_t, boost::dynamic_bitset<>>* matchTracker;
++};
++
++}
++
++#endif // TRACKINGTERMQUERY_H
+\ No newline at end of file
+diff --git a/include/lucene++/TrackingTermQuery2.h b/include/lucene++/TrackingTermQuery2.h
+new file mode 100644
+index 0000000..2b2a007
+--- /dev/null
++++ b/include/lucene++/TrackingTermQuery2.h
+@@ -0,0 +1,27 @@
++#ifndef TRACKINGTERMQUERY2_H
++#define TRACKINGTERMQUERY2_H
++
++#include <vector>
++#include "TermQuery.h"
++
++namespace Lucene {
++
++class LPPAPI TrackingTermQuery2 : public TermQuery {
++public:
++    TrackingTermQuery2(const TermPtr& term, size_t bitIndex,
++                      std::vector<std::vector<int32_t>>* matchTracker);
++    virtual ~TrackingTermQuery2();
++    virtual WeightPtr createWeight(const SearcherPtr& searcher) override;
++    virtual QueryPtr rewrite(const IndexReaderPtr& reader) override;
++
++    friend class TrackingTermWeight2;
++    friend class TermWeight;  
++
++private:
++    size_t bitIndex;
++    std::vector<std::vector<int32_t>>* matchTracker;
++};
++
++}
++
++#endif // TRACKINGTERMQUERY2_H
+\ No newline at end of file
+diff --git a/include/lucene++/TrackingTermScorer.h b/include/lucene++/TrackingTermScorer.h
+new file mode 100644
+index 0000000..c4c3427
+--- /dev/null
++++ b/include/lucene++/TrackingTermScorer.h
+@@ -0,0 +1,43 @@
++#ifndef TRACKINGTERMSCORER_H
++#define TRACKINGTERMSCORER_H
++
++#include <unordered_map>
++#include "TermScorer.h"
++#include "boost/dynamic_bitset.hpp"
++
++namespace Lucene {
++
++class LPPAPI TrackingTermScorer : public TermScorer {
++public:
++    /// Construct a TrackingTermScorer.
++    /// @param weight The weight of the Term in the query.
++    /// @param td An iterator over the documents matching the Term.
++    /// @param similarity The Similarity implementation to be used for score computations.
++    /// @param norms The field norms of the document fields for the Term.
++    /// @param bitIndex The index of the term amongst the other terms in the query.
++    /// @param matchTracker The mapping between each matched chunk to the terms from the query that appear in it.
++    TrackingTermScorer(const WeightPtr& weight,
++                       const TermDocsPtr& td,
++                       const SimilarityPtr& similarity,
++                       ByteArray norms,
++                       size_t bitIndex,
++                       size_t num_terms,
++                       std::unordered_map<int32_t, boost::dynamic_bitset<>>* matchTracker);
++    virtual ~TrackingTermScorer();   
++    virtual bool score(const CollectorPtr& collector, int32_t max, int32_t firstDocID) override;
++    virtual double score() override;
++    void setDocBase(int32_t docBase) override;
++
++
++    LUCENE_CLASS(TrackingTermScorer);
++
++private:
++    int32_t docBase;
++    size_t bitIndex;
++    size_t num_terms;
++    std::unordered_map<int32_t, boost::dynamic_bitset<>>* matchTracker;
++};
++
++}
++
++#endif // TRACKINGTERMSCORER_H
+diff --git a/include/lucene++/TrackingTermScorer2.h b/include/lucene++/TrackingTermScorer2.h
+new file mode 100644
+index 0000000..c3649fc
+--- /dev/null
++++ b/include/lucene++/TrackingTermScorer2.h
+@@ -0,0 +1,40 @@
++#ifndef TRACKINGTERMSCORER2_H
++#define TRACKINGTERMSCORER2_H
++
++#include <vector>
++#include "TermScorer.h"
++
++namespace Lucene {
++
++class LPPAPI TrackingTermScorer2 : public TermScorer {
++public:
++    /// Construct a TrackingTermScorer2.
++    /// @param weight The weight of the Term in the query.
++    /// @param td An iterator over the documents matching the Term.
++    /// @param similarity The Similarity implementation to be used for score computations.
++    /// @param norms The field norms of the document fields for the Term.
++    /// @param bitIndex The index of the term amongst the other terms in the query.
++    /// @param matchTracker The mapping between each term from the query to the chunks that it appears in.
++    TrackingTermScorer2(const WeightPtr& weight,
++                       const TermDocsPtr& td,
++                       const SimilarityPtr& similarity,
++                       ByteArray norms,
++                       size_t bitIndex,
++                       std::vector<std::vector<int32_t>>* matchTracker);
++    virtual ~TrackingTermScorer2();   
++    virtual bool score(const CollectorPtr& collector, int32_t max, int32_t firstDocID) override;
++    virtual double score() override;
++    void setDocBase(int32_t docBase) override;
++
++
++    LUCENE_CLASS(TrackingTermScorer2);
++
++private:
++    int32_t docBase;
++    size_t bitIndex;
++    std::vector<std::vector<int32_t>>* matchTracker;
++};
++
++}
++
++#endif // TRACKINGTERMSCORER2_H
+diff --git a/include/lucene++/TrackingTermWeight.h b/include/lucene++/TrackingTermWeight.h
+new file mode 100644
+index 0000000..1a67c72
+--- /dev/null
++++ b/include/lucene++/TrackingTermWeight.h
+@@ -0,0 +1,31 @@
++#ifndef TRACKINGTERMWEIGHT_H
++#define TRACKINGTERMWEIGHT_H
++
++#include <unordered_map>
++#include "_TermQuery.h"
++#include "TrackingTermQuery.h"
++#include "boost/dynamic_bitset.hpp"
++
++namespace Lucene {
++
++class LPPAPI TrackingTermWeight : public TermWeight {
++public:
++    TrackingTermWeight(const TrackingTermQueryPtr& query,
++                       const SearcherPtr& searcher,
++                       size_t bitIndex,
++                       size_t num_terms,
++                       std::unordered_map<int32_t, boost::dynamic_bitset<>>* matchTracker);
++    virtual ~TrackingTermWeight();
++    virtual ScorerPtr scorer(const IndexReaderPtr& reader, bool scoreDocsInOrder, bool topScorer) override;
++
++    LUCENE_CLASS(TrackingTermWeight);
++
++private:
++    size_t bitIndex;
++    size_t num_terms;
++    std::unordered_map<int32_t, boost::dynamic_bitset<>>* matchTracker;
++};
++
++}
++
++#endif // TRACKINGTERMWEIGHT_H
+\ No newline at end of file
+diff --git a/include/lucene++/TrackingTermWeight2.h b/include/lucene++/TrackingTermWeight2.h
+new file mode 100644
+index 0000000..18600af
+--- /dev/null
++++ b/include/lucene++/TrackingTermWeight2.h
+@@ -0,0 +1,28 @@
++#ifndef TRACKINGTERMWEIGHT2_H
++#define TRACKINGTERMWEIGHT2_H
++
++#include <vector>
++#include "_TermQuery.h"
++#include "TrackingTermQuery2.h"
++
++namespace Lucene {
++
++class LPPAPI TrackingTermWeight2 : public TermWeight {
++public:
++    TrackingTermWeight2(const TrackingTermQuery2Ptr& query,
++                       const SearcherPtr& searcher,
++                       size_t bitIndex,
++                       std::vector<std::vector<int32_t>>* matchTracker);
++    virtual ~TrackingTermWeight2();
++    virtual ScorerPtr scorer(const IndexReaderPtr& reader, bool scoreDocsInOrder, bool topScorer) override;
++
++    LUCENE_CLASS(TrackingTermWeight2);
++
++private:
++    size_t bitIndex;
++    std::vector<std::vector<int32_t>>* matchTracker;
++};
++
++}
++
++#endif // TRACKINGTERMWEIGHT2_H
+\ No newline at end of file
+diff --git a/src/core/search/BooleanQuery.cpp b/src/core/search/BooleanQuery.cpp
+index 1376d24..781bf8a 100644
+--- a/src/core/search/BooleanQuery.cpp
++++ b/src/core/search/BooleanQuery.cpp
+@@ -328,9 +328,10 @@ ScorerPtr BooleanWeight::scorer(const IndexReaderPtr& reader, bool scoreDocsInOr
+     }
+ 
+     // Check if we can return a BooleanScorer
+-    if (!scoreDocsInOrder && topScorer && required.empty() && prohibited.size() < 32) {
+-        return newLucene<BooleanScorer>(similarity, query->minNrShouldMatch, optional, prohibited);
+-    }
++    // if (!scoreDocsInOrder && topScorer && required.empty() && prohibited.size() < 32) {
++    //     std::cout << "zzzzzzzzzz" << std::endl;
++    //     return newLucene<BooleanScorer>(similarity, query->minNrShouldMatch, optional, prohibited);
++    // }
+ 
+     if (required.empty() && optional.empty()) {
+         // no required and optional clauses.
+diff --git a/src/core/search/BooleanScorer.cpp b/src/core/search/BooleanScorer.cpp
+index ace799d..75a07aa 100644
+--- a/src/core/search/BooleanScorer.cpp
++++ b/src/core/search/BooleanScorer.cpp
+@@ -159,6 +159,12 @@ void BooleanScorer::score(const CollectorPtr& collector) {
+     score(collector, INT_MAX, nextDoc());
+ }
+ 
++void BooleanScorer::setDocBase(int32_t docBase) {
++    for (SubScorerPtr sub(scorers); sub; sub = sub->next) {
++        sub->scorer->setDocBase(docBase);
++    }
++}
++
+ String BooleanScorer::toString() {
+     StringStream buffer;
+     buffer << L"boolean(";
+diff --git a/src/core/search/BooleanScorer2.cpp b/src/core/search/BooleanScorer2.cpp
+index 81010f0..8fccf78 100644
+--- a/src/core/search/BooleanScorer2.cpp
++++ b/src/core/search/BooleanScorer2.cpp
+@@ -28,7 +28,6 @@ void BooleanScorer2::initialize() {
+     if (minNrShouldMatch < 0) {
+         boost::throw_exception(IllegalArgumentException(L"Minimum number of optional scorers should not be negative"));
+     }
+-
+     coordinator = newLucene<Coordinator>(shared_from_this());
+     coordinator->maxCoord += optionalScorers.size();
+     coordinator->maxCoord += requiredScorers.size();
+@@ -129,6 +128,19 @@ int32_t BooleanScorer2::advance(int32_t target) {
+     return doc;
+ }
+ 
++void BooleanScorer2::setDocBase(int32_t docBase) {
++    for (int i = 0; i < requiredScorers.size(); ++i) {
++        requiredScorers[i]->setDocBase(docBase);
++    }
++    for (int i = 0; i < optionalScorers.size(); ++i) {
++        optionalScorers[i]->setDocBase(docBase);
++    }
++    for (int i = 0; i < prohibitedScorers.size(); ++i) {
++        prohibitedScorers[i]->setDocBase(docBase);
++    }
++}
++
++
+ Coordinator::Coordinator(const BooleanScorer2Ptr& scorer) {
+     _scorer = scorer;
+     maxCoord = 0;
+diff --git a/src/core/search/IndexSearcher.cpp b/src/core/search/IndexSearcher.cpp
+index 293b258..53f60f2 100644
+--- a/src/core/search/IndexSearcher.cpp
++++ b/src/core/search/IndexSearcher.cpp
+@@ -106,10 +106,12 @@ TopFieldDocsPtr IndexSearcher::search(const WeightPtr& weight, const FilterPtr&
+ }
+ 
+ void IndexSearcher::search(const WeightPtr& weight, const FilterPtr& filter, const CollectorPtr& results) {
++    std::wcout << "Currently working on query: " << weight->getQuery()->toString() << std::endl;
+     if (!filter) {
+         for (int32_t i = 0; i < subReaders.size(); ++i) { // search each subreader
+             results->setNextReader(subReaders[i], docStarts[i]);
+             ScorerPtr scorer(weight->scorer(subReaders[i], !results->acceptsDocsOutOfOrder(), true));
++            results->setScorer(scorer);
+             if (scorer) {
+                 scorer->score(results);
+             }
+diff --git a/src/core/search/Scorer.cpp b/src/core/search/Scorer.cpp
+index 36a0517..6451a94 100644
+--- a/src/core/search/Scorer.cpp
++++ b/src/core/search/Scorer.cpp
+@@ -64,6 +64,10 @@ namespace Lucene {
+         
+         visitSubScorers(s_obj, BooleanClause::MUST/*must id default*/, visitor);
+     }
++
++    void Scorer::setDocBase(int32_t docBase) {
++
++    }
+     
+     
+     
+diff --git a/src/core/search/TrackingTermQuery.cpp b/src/core/search/TrackingTermQuery.cpp
+new file mode 100644
+index 0000000..49b23f8
+--- /dev/null
++++ b/src/core/search/TrackingTermQuery.cpp
+@@ -0,0 +1,32 @@
++/////////////////////////////////////////////////////////////////////////////
++// Copyright (c) 2009-2014 Alan Wright. All rights reserved.
++// Distributable under the terms of either the Apache License (Version 2.0)
++// or the GNU Lesser General Public License.
++/////////////////////////////////////////////////////////////////////////////
++
++#include "TrackingTermQuery.h"
++#include "TrackingTermWeight.h"
++
++namespace Lucene {
++
++TrackingTermQuery::TrackingTermQuery(const TermPtr& term, size_t bitIndex, size_t num_terms,
++                      std::unordered_map<int32_t, boost::dynamic_bitset<>>* matchTracker) : TermQuery(term) {
++    this->bitIndex = bitIndex;
++    this->num_terms = num_terms;
++    this->matchTracker = matchTracker;
++}
++
++TrackingTermQuery::~TrackingTermQuery() {
++}
++
++WeightPtr TrackingTermQuery::createWeight(const SearcherPtr& searcher) {
++    TrackingTermQueryPtr trackingThis = boost::dynamic_pointer_cast<TrackingTermQuery>(shared_from_this());
++    return newLucene<TrackingTermWeight>(trackingThis, searcher, bitIndex, num_terms, matchTracker);
++}
++
++QueryPtr TrackingTermQuery::rewrite(const IndexReaderPtr& reader) {
++    // Prevent rewriting: keep this query as-is.
++    return boost::dynamic_pointer_cast<TrackingTermQuery>(shared_from_this());
++}
++
++}
+diff --git a/src/core/search/TrackingTermQuery2.cpp b/src/core/search/TrackingTermQuery2.cpp
+new file mode 100644
+index 0000000..178f043
+--- /dev/null
++++ b/src/core/search/TrackingTermQuery2.cpp
+@@ -0,0 +1,31 @@
++/////////////////////////////////////////////////////////////////////////////
++// Copyright (c) 2009-2014 Alan Wright. All rights reserved.
++// Distributable under the terms of either the Apache License (Version 2.0)
++// or the GNU Lesser General Public License.
++/////////////////////////////////////////////////////////////////////////////
++
++#include "TrackingTermQuery2.h"
++#include "TrackingTermWeight2.h"
++
++namespace Lucene {
++
++TrackingTermQuery2::TrackingTermQuery2(const TermPtr& term, size_t bitIndex,
++                      std::vector<std::vector<int32_t>>* matchTracker) : TermQuery(term) {
++    this->bitIndex = bitIndex;
++    this->matchTracker = matchTracker;
++}
++
++TrackingTermQuery2::~TrackingTermQuery2() {
++}
++
++WeightPtr TrackingTermQuery2::createWeight(const SearcherPtr& searcher) {
++    TrackingTermQuery2Ptr trackingThis = boost::dynamic_pointer_cast<TrackingTermQuery2>(shared_from_this());
++    return newLucene<TrackingTermWeight2>(trackingThis, searcher, bitIndex, matchTracker);
++}
++
++QueryPtr TrackingTermQuery2::rewrite(const IndexReaderPtr& reader) {
++    // Prevent rewriting: keep this query as-is.
++    return boost::dynamic_pointer_cast<TrackingTermQuery2>(shared_from_this());
++}
++
++}
+diff --git a/src/core/search/TrackingTermScorer.cpp b/src/core/search/TrackingTermScorer.cpp
+new file mode 100644
+index 0000000..1919967
+--- /dev/null
++++ b/src/core/search/TrackingTermScorer.cpp
+@@ -0,0 +1,83 @@
++/////////////////////////////////////////////////////////////////////////////
++// Copyright (c) 2009-2014 Alan Wright. All rights reserved.
++// Distributable under the terms of either the Apache License (Version 2.0)
++// or the GNU Lesser General Public License.
++/////////////////////////////////////////////////////////////////////////////
++
++#include "LuceneInc.h"
++#include "TrackingTermScorer.h"
++#include "TrackingTermQuery.h"
++#include "TermDocs.h"
++#include "Similarity.h"
++#include "Weight.h"
++#include "Collector.h"
++#include "StringUtils.h"
++#include "Term.h"
++
++
++namespace Lucene {
++
++TrackingTermScorer::TrackingTermScorer(const WeightPtr& weight,
++                       const TermDocsPtr& td,
++                       const SimilarityPtr& similarity,
++                       ByteArray norms,
++                       size_t bitIndex,
++                       size_t num_terms,
++                       std::unordered_map<int32_t, boost::dynamic_bitset<>>* matchTracker)
++                       : TermScorer(weight, td, similarity, norms) {
++    this->bitIndex = bitIndex;
++    this->num_terms = num_terms;
++    this->matchTracker = matchTracker;
++}
++
++TrackingTermScorer::~TrackingTermScorer() {
++}
++
++bool TrackingTermScorer::score(const CollectorPtr& collector, int32_t max, int32_t firstDocID) {
++    // firstDocID is ignored since nextDoc() sets 'doc'
++    auto* __collector = collector.get();
++    __collector->setScorer(shared_from_this());
++    while (doc < max) { // for docs in window
++        __collector->collect(doc);
++
++        if (++pointer >= pointerMax) {
++            pointerMax = __termDocs->read(docs, freqs); // refill buffers
++            if (pointerMax != 0) {
++                pointer = 0;
++            } else {
++                __termDocs->close(); // close stream
++                doc = INT_MAX; // set to sentinel value
++                return false;
++            }
++        }
++        doc = __docs->operator[](pointer);
++        freq = __freqs->operator[](pointer);
++
++        auto doc_bitmap = matchTracker->find(docBase + doc);
++        if (doc_bitmap == matchTracker->end()) {
++            matchTracker->emplace(docBase + doc, boost::dynamic_bitset<>(num_terms));
++            doc_bitmap = matchTracker->find(docBase + doc);
++        }
++        doc_bitmap->second[bitIndex] = true;
++    }
++    return true;
++}
++
++double TrackingTermScorer::score() {
++    BOOST_ASSERT(doc != -1);
++    auto doc_bitmap = matchTracker->find(docBase + doc);
++    if (doc_bitmap == matchTracker->end()) {
++        matchTracker->emplace(docBase + doc, boost::dynamic_bitset<>(num_terms));
++        doc_bitmap = matchTracker->find(docBase + doc);
++    }
++    doc_bitmap->second[bitIndex] = true;
++    return freq;
++}
++
++
++void TrackingTermScorer::setDocBase(int32_t docBase) {
++    this->docBase = docBase;
++}
++
++
++}
+diff --git a/src/core/search/TrackingTermScorer2.cpp b/src/core/search/TrackingTermScorer2.cpp
+new file mode 100644
+index 0000000..08892ff
+--- /dev/null
++++ b/src/core/search/TrackingTermScorer2.cpp
+@@ -0,0 +1,73 @@
++/////////////////////////////////////////////////////////////////////////////
++// Copyright (c) 2009-2014 Alan Wright. All rights reserved.
++// Distributable under the terms of either the Apache License (Version 2.0)
++// or the GNU Lesser General Public License.
++/////////////////////////////////////////////////////////////////////////////
++
++#include "LuceneInc.h"
++#include "TrackingTermScorer2.h"
++#include "TrackingTermQuery2.h"
++#include "TermDocs.h"
++#include "Similarity.h"
++#include "Weight.h"
++#include "Collector.h"
++#include "StringUtils.h"
++#include "Term.h"
++
++
++namespace Lucene {
++
++TrackingTermScorer2::TrackingTermScorer2(const WeightPtr& weight,
++                       const TermDocsPtr& td,
++                       const SimilarityPtr& similarity,
++                       ByteArray norms,
++                       size_t bitIndex,
++                       std::vector<std::vector<int32_t>>* matchTracker)
++                       : TermScorer(weight, td, similarity, norms) {
++    this->bitIndex = bitIndex;
++    this->matchTracker = matchTracker;
++}
++
++TrackingTermScorer2::~TrackingTermScorer2() {
++}
++
++bool TrackingTermScorer2::score(const CollectorPtr& collector, int32_t max, int32_t firstDocID) {
++    // firstDocID is ignored since nextDoc() sets 'doc'
++    auto* __collector = collector.get();
++    __collector->setScorer(shared_from_this());
++    while (doc < max) { // for docs in window
++        // Record current doc in matchTracker before advancing
++        (*matchTracker)[bitIndex].push_back(docBase + doc);
++
++        __collector->collect(doc);
++
++        if (++pointer >= pointerMax) {
++            pointerMax = __termDocs->read(docs, freqs); // refill buffers
++            if (pointerMax != 0) {
++                pointer = 0;
++            } else {
++                __termDocs->close(); // close stream
++                doc = INT_MAX; // set to sentinel value
++                return false;
++            }
++        }
++        doc = __docs->operator[](pointer);
++        freq = __freqs->operator[](pointer);
++    }
++    return true;
++}
++
++double TrackingTermScorer2::score() {
++    BOOST_ASSERT(doc != -1);
++    auto& vec = (*matchTracker)[bitIndex];
++    vec.push_back(docBase + doc);
++    return freq;
++}
++
++
++void TrackingTermScorer2::setDocBase(int32_t docBase) {
++    this->docBase = docBase;
++}
++
++
++}
+diff --git a/src/core/search/TrackingTermWeight.cpp b/src/core/search/TrackingTermWeight.cpp
+new file mode 100644
+index 0000000..b863692
+--- /dev/null
++++ b/src/core/search/TrackingTermWeight.cpp
+@@ -0,0 +1,36 @@
++/////////////////////////////////////////////////////////////////////////////
++// Copyright (c) 2009-2014 Alan Wright. All rights reserved.
++// Distributable under the terms of either the Apache License (Version 2.0)
++// or the GNU Lesser General Public License.
++/////////////////////////////////////////////////////////////////////////////
++
++#include "Term.h"
++#include "TermDocs.h"
++#include "IndexReader.h"
++#include "TrackingTermWeight.h"
++#include "TrackingTermScorer.h"
++#include "TrackingTermQuery.h"
++
++namespace Lucene {
++
++TrackingTermWeight::TrackingTermWeight(const TrackingTermQueryPtr& query,
++                       const SearcherPtr& searcher,
++                       size_t bitIndex,
++                       size_t num_terms,
++                       std::unordered_map<int32_t, boost::dynamic_bitset<>>* matchTracker)
++                       : TermWeight(query, searcher) {
++    this->bitIndex = bitIndex;
++    this->num_terms = num_terms;
++    this->matchTracker = matchTracker;
++}
++
++TrackingTermWeight::~TrackingTermWeight() {
++}
++
++ScorerPtr TrackingTermWeight::scorer(const IndexReaderPtr& reader, bool scoreDocsInOrder, bool topScorer) {
++    TrackingTermQueryPtr trackingQuery = boost::dynamic_pointer_cast<TrackingTermQuery>(this->query);
++    TermDocsPtr termDocs(reader->termDocs(trackingQuery->getTerm()));
++    return termDocs ? newLucene<TrackingTermScorer>(shared_from_this(), termDocs, similarity, reader->norms((query->getTerm())->field()), bitIndex, num_terms, matchTracker) : ScorerPtr();
++}
++
++}
+diff --git a/src/core/search/TrackingTermWeight2.cpp b/src/core/search/TrackingTermWeight2.cpp
+new file mode 100644
+index 0000000..e62809f
+--- /dev/null
++++ b/src/core/search/TrackingTermWeight2.cpp
+@@ -0,0 +1,34 @@
++/////////////////////////////////////////////////////////////////////////////
++// Copyright (c) 2009-2014 Alan Wright. All rights reserved.
++// Distributable under the terms of either the Apache License (Version 2.0)
++// or the GNU Lesser General Public License.
++/////////////////////////////////////////////////////////////////////////////
++
++#include "Term.h"
++#include "TermDocs.h"
++#include "IndexReader.h"
++#include "TrackingTermWeight2.h"
++#include "TrackingTermScorer2.h"
++#include "TrackingTermQuery2.h"
++
++namespace Lucene {
++
++TrackingTermWeight2::TrackingTermWeight2(const TrackingTermQuery2Ptr& query,
++                       const SearcherPtr& searcher,
++                       size_t bitIndex,
++                       std::vector<std::vector<int32_t>>* matchTracker)
++                       : TermWeight(query, searcher) {
++    this->bitIndex = bitIndex;
++    this->matchTracker = matchTracker;
++}
++
++TrackingTermWeight2::~TrackingTermWeight2() {
++}
++
++ScorerPtr TrackingTermWeight2::scorer(const IndexReaderPtr& reader, bool scoreDocsInOrder, bool topScorer) {
++    TrackingTermQuery2Ptr trackingQuery = boost::dynamic_pointer_cast<TrackingTermQuery2>(this->query);
++    TermDocsPtr termDocs(reader->termDocs(trackingQuery->getTerm()));
++    return termDocs ? newLucene<TrackingTermScorer2>(shared_from_this(), termDocs, similarity, reader->norms((query->getTerm())->field()), bitIndex, matchTracker) : ScorerPtr();
++}
++
++}
+diff --git a/src/core/util/FileUtils.cpp b/src/core/util/FileUtils.cpp
+index d92efbb..d790ab5 100644
+--- a/src/core/util/FileUtils.cpp
++++ b/src/core/util/FileUtils.cpp
+@@ -7,7 +7,7 @@
+ #include "LuceneInc.h"
+ #include <boost/filesystem/operations.hpp>
+ #include <boost/filesystem/path.hpp>
+-#include <boost/filesystem/directory.hpp>
++#include <boost/filesystem.hpp>
+ #include "LuceneThread.h"
+ #include "StringUtils.h"
+ #include "FileUtils.h"
