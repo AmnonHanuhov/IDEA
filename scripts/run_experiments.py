@@ -264,11 +264,14 @@ def _not_experiment(regime_id: str, query: str, purpose: str, kw_files: list) ->
         kw_files=kw_files,
     )
 
-def _not_seg_experiment(regime_id: str, query: str, purpose: str, kw_files: list) -> Experiment:
+def _not_seg_experiment(regime_id: str, query: str, purpose: str, kw_files: list,
+                        files_per_seg: int = 1024, sparse: bool = False) -> Experiment:
+    suffix = "-sparse" if sparse else ""
+    cmd = ["-j", query, "-P", str(files_per_seg)] + (["-S"] if sparse else [])
     return Experiment(
-        name=f"dedup+seg {regime_id}",
-        cmd=["-j", query],
-        desc=f"[dedup+seg] {purpose}",
+        name=f"dedup+{files_per_seg}seg{suffix} {regime_id}",
+        cmd=cmd,
+        desc=f"[dedup+{files_per_seg}seg{suffix}] {purpose}",
         group=regime_id,
         query_plain=lucene_to_plain(query),
         purpose=purpose,
@@ -358,6 +361,108 @@ def not_regimes_suite(kw_base: str) -> list:
 
 def not_baseline_suite(kw_base: str) -> list:
     return _build_not_experiments(include_naive=True, kw_base=kw_base)
+
+
+# ---------------------------------------------------------------------------
+# Suite: segment-filter significance
+# ---------------------------------------------------------------------------
+# The offline segment bitmask lets the NOT/AND phases skip an excluded chunk
+# (and its reverse-mapping fetch) whenever the chunk's per-chunk segment
+# bitmask does not overlap the candidate mask.  A skip is only possible when
+# the AND survivors are concentrated in FEW segments, so this suite sweeps the
+# two knobs that control segment locality of the candidate set:
+#
+#   A. AND tightness   — more included terms → smaller, more segment-local
+#                        candidate set → more skips.  (Excluded term fixed.)
+#   B. Excluded size   — a larger excluded posting list gives more chunks that
+#                        the filter can potentially skip.  (Included AND fixed.)
+#
+# Each experiment runs both plain dedup (-i) and dedup+seg (-j) so the skip
+# counts, avoided reverse-mapping fetches, and AND+NOT eval time can be
+# compared directly.
+
+# Segment granularities (files per segment) to compare, coarse → fine.
+SEG_SIZES = [1024, 256, 64]
+# When True, also emit the sparse (sorted segment-id list) variant next to each
+# dense one, for a dense-vs-sparse head-to-head.
+SEG_COMPARE_SPARSE = True
+
+# Mid-frequency excluded terms (wiki-specific): ~10^4 chunks each and
+# segment-local, so a tight AND + one of these yields a large *and* highly
+# skippable excluded list.  (term, short-tag-for-regime-name)
+MID_EXCLUDED_TERMS = [("glowing", "glowing")]
+
+def seg_filter_suite(kw_base: str) -> list:
+    experiments = []
+
+    med_pool  = read_keywords("med",  8, kw_base)
+    high_pool = read_keywords("high", 8, kw_base)
+    low_pool  = read_keywords("low",  8, kw_base)
+    mf = kw_file("file_med",  8, kw_base)
+    hf = kw_file("file_high", 8, kw_base)
+    lf = kw_file("file_low",  8, kw_base)
+
+    def add(regime_id, incl, excl, purpose, files):
+        if not incl or not excl:
+            print(f"  [skip] {regime_id}: missing keywords (run destor --kw-dataset <name> -z first)")
+            return
+        query = build_query(incl, excl)
+        experiments.append(_not_experiment(regime_id, query, purpose, files))
+        for fps in SEG_SIZES:
+            experiments.append(_not_seg_experiment(regime_id, query, purpose, files, fps, sparse=False))
+            if SEG_COMPARE_SPARSE:
+                experiments.append(_not_seg_experiment(regime_id, query, purpose, files, fps, sparse=True))
+        experiments.append(_naive_experiment(regime_id, query, purpose, files))
+
+    # --- A: AND-tightness sweep (excluded fixed = 1 common term) ---
+    if high_pool and med_pool:
+        excl1 = [high_pool[0]]
+        for k in (1, 2, 3, 4):
+            if len(med_pool) >= k:
+                add(f"A{k}_and{k}med_not1high", med_pool[:k], excl1,
+                    f"{k}-term med AND — candidate set (and its segment footprint) "
+                    f"shrinks as k grows",
+                    [mf, hf])
+
+    # --- B: excluded-list-size sweep (included fixed = 3 med terms) ---
+    if len(med_pool) >= 4:
+        incl3 = med_pool[:3]
+        if low_pool:
+            add("B1_and3med_not1low", incl3, [low_pool[0]],
+                "Tight AND + tiny excluded list", [mf, lf])
+        add("B2_and3med_not1med", incl3, [med_pool[3]],
+            "Tight AND + medium excluded list", [mf])
+        if len(high_pool) >= 3:
+            add("B3_and3med_not3high", incl3, high_pool[:3],
+                "Tight AND + very large (3-term) excluded list", [mf, hf])
+
+    # --- C: hero regime — tight AND (few candidate segments) + MANY rare
+    #        excluded terms whose chunks are segment-local, so the filter can
+    #        actually skip them.  Skips scale with the number of rare excluded
+    #        terms while the per-chunk skip rate stays roughly constant. ---
+    low_many = read_keywords("low", 64, kw_base)   # keywords_64.txt exists; slice below
+    if len(med_pool) >= 4 and len(low_many) >= 15:
+        incl4 = med_pool[:4]   # collapses the candidate set into ~2 segments
+        for n in (15, 30, 60):
+            if len(low_many) >= n:
+                add(f"C{n}_and4med_not{n}rare", incl4, low_many[:n],
+                    f"Tight AND (candidate ~2 segments) + {n} rare excluded terms "
+                    f"→ segment filter skips segment-local excluded chunks",
+                    [mf, lf])
+
+    # --- D: mid-frequency excluded (wiki-specific) — tight AND + a single
+    #        excluded term with ~a few ten thousand chunks that are also
+    #        segment-local, so a HIGH skip % removes enough reverse-mapping
+    #        decodes to show up in wall time (unlike the small-excluded C
+    #        regimes, and with a higher skip % than the ubiquitous A4 term). ---
+    for term, tag in MID_EXCLUDED_TERMS:
+        if len(med_pool) >= 4:
+            add(f"D_{tag}_and4med_not1mid", med_pool[:4], [term],
+                f"Tight AND + mid-frequency excluded '{term}' "
+                f"(~10^4 chunks, segment-local)",
+                [mf, hf])
+
+    return experiments
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +573,7 @@ _SUITE_FNS = {
     "and_impl":     (and_impl_suite,     and_impl_suite_old),
     "not_regimes":  (not_regimes_suite,  not_regimes_suite_old),
     "not_baseline": (not_baseline_suite, not_baseline_suite_old),
+    "seg_filter":   (seg_filter_suite,   seg_filter_suite),
 }
 
 # Keep backward-compatible SUITES dict (new format)
@@ -856,7 +962,7 @@ def _is_naive(name: str) -> bool:
     return name.lower().startswith("naive")
 
 def _is_dedup_seg(name: str) -> bool:
-    return name.lower().startswith("dedup+seg")
+    return name.lower().startswith("dedup+")
 
 def _bar_components(name: str) -> list:
     if _is_naive(name):     return _NAIVE_COMPONENTS
@@ -869,6 +975,9 @@ def _short_label(name: str) -> str:
     if _is_naive(name):
         return "Naive"
     if _is_dedup_seg(name):
+        m = re.match(r"dedup\+(\d+)seg(-sparse)?", name.lower())
+        if m:
+            return f"+{m.group(1)}/{'S' if m.group(2) else 'D'}"
         return "Dedup+Seg"
     if "[inc]" in name:
         return "Dedup (inc)"
