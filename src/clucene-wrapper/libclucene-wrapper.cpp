@@ -28,7 +28,9 @@ double searcher_load_time = 0, dtor_time = 0;
 
 static const uint32_t DEFAULT_FILES_PER_SEG = 1024;
 static const uint64_t SEG_BITMASK_MAGIC = 0x5345474D41534B32ULL; // "SEGMASK2" (dense)
-static const uint64_t SEG_SPARSE_MAGIC  = 0x5345475350415253ULL; // "SEGSPARS" (sparse)
+static const uint64_t SEG_SPARSE_MAGIC  = 0x53454753424C4B31ULL; // "SEGSBLK1" (sparse, blocked)
+static const uint64_t SEG_SPARSE_MAGIC_V1 = 0x5345475350415253ULL; // "SEGSPARS" (superseded)
+static const uint32_t SEG_BLOCK_CHUNKS = 64;   // chunks per self-contained block
 
 // Path of the bitmask file for a given segment size and representation (encoded
 // in the name so several granularities / formats can coexist).
@@ -115,12 +117,20 @@ void saveSegmentBitmask(const std::string& index_path, int files_per_seg) {
 }
 
 // Build and persist the SPARSE variant: per chunk, the sorted list of segment
-// ids it touches, in CSR form.  Layout:
-//     [magic][files_per_seg][num_chunks N][total_entries E]
-//     offsets : (N+1) x uint32   (entry index where each chunk's list starts)
-//     segs    :  E    x uint16   (sorted segment ids, concatenated)
-// Size is ~constant across granularities (a chunk touches ~fanout segments),
-// so it avoids the dense format's blow-up at fine segment sizes.
+// ids it touches.  Chunks are grouped into self-contained blocks of
+// SEG_BLOCK_CHUNKS, each holding its own uint16 local offsets followed by its
+// own segment ids:
+//     [magic][files_per_seg][num_chunks N][block_chunks B]
+//     [num_blocks NB][total_entries E][blocks_bytes][reserved]
+//     block_offsets : (NB+1) x uint64   byte offset of each block
+//     blocks        : per block { uint16 local_off[B+1]; uint16 segs[...] }
+//
+// The earlier layout kept one global uint32 offset array followed by all the
+// segment ids, so every lookup touched two regions tens of MB apart and the
+// kernel saw two interleaved streams instead of one.  Here the only wide jump
+// is into block_offsets, which is ~8 bytes per 64 chunks (a couple of MB for a
+// 15M-chunk index) and stays resident, while the bulk is read as a single
+// forward stream.  Local uint16 offsets also cost less than global uint32 ones.
 void saveSegmentBitmaskSparse(const std::string& index_path, int files_per_seg) {
     if (files_per_seg <= 0) files_per_seg = DEFAULT_FILES_PER_SEG;
     auto reader = IndexReader::open(FSDirectory::open(toWstring(index_path)));
@@ -153,21 +163,42 @@ void saveSegmentBitmaskSparse(const std::string& index_path, int files_per_seg) 
         return;
     }
 
-    // Pass 2 (in memory): sorted-unique segment list per chunk -> CSR.
-    std::vector<uint32_t> segOffsets((size_t)maxDoc + 1, 0);
-    std::vector<uint16_t> segData;
-    segData.reserve(flatFiles.size());
-    std::vector<uint16_t> tmp;
-    for (int32_t docId = 0; docId < maxDoc; ++docId) {
-        segOffsets[docId] = (uint32_t)segData.size();
-        tmp.clear();
-        for (uint64_t k = offsets[docId]; k < offsets[docId + 1]; ++k)
-            tmp.push_back((uint16_t)(flatFiles[k] / (uint32_t)files_per_seg));
-        std::sort(tmp.begin(), tmp.end());
-        tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
-        segData.insert(segData.end(), tmp.begin(), tmp.end());
+    const uint32_t B  = SEG_BLOCK_CHUNKS;
+    const uint64_t NB = ((uint64_t)maxDoc + B - 1) / B;
+
+    // Pass 2 (in memory): build each block, recording its byte offset.
+    std::vector<uint64_t> blockOffsets((size_t)NB + 1, 0);
+    std::vector<uint8_t>  blocks;
+    blocks.reserve((size_t)flatFiles.size() * 2 + (size_t)NB * (B + 1) * 2);
+    std::vector<uint16_t> local(B + 1), tmp;
+    uint64_t totalEntries = 0;
+
+    for (uint64_t b = 0; b < NB; ++b) {
+        blockOffsets[(size_t)b] = blocks.size();
+        std::vector<uint16_t> blockSegs;
+        uint32_t entries = 0;
+        for (uint32_t i = 0; i < B; ++i) {
+            local[i] = (uint16_t)entries;
+            int64_t docId = (int64_t)b * B + i;
+            if (docId >= maxDoc) continue;          // tail block: pad with equal offsets
+            tmp.clear();
+            for (uint64_t k = offsets[(size_t)docId]; k < offsets[(size_t)docId + 1]; ++k)
+                tmp.push_back((uint16_t)(flatFiles[k] / (uint32_t)files_per_seg));
+            std::sort(tmp.begin(), tmp.end());
+            tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
+            blockSegs.insert(blockSegs.end(), tmp.begin(), tmp.end());
+            entries += (uint32_t)tmp.size();
+        }
+        local[B] = (uint16_t)entries;
+        totalEntries += entries;
+
+        const uint8_t* lo = reinterpret_cast<const uint8_t*>(local.data());
+        blocks.insert(blocks.end(), lo, lo + (size_t)(B + 1) * sizeof(uint16_t));
+        const uint8_t* sg = reinterpret_cast<const uint8_t*>(blockSegs.data());
+        blocks.insert(blocks.end(), sg, sg + blockSegs.size() * sizeof(uint16_t));
+        while (blocks.size() % 8) blocks.push_back(0);   // keep blocks 8-byte aligned
     }
-    segOffsets[maxDoc] = (uint32_t)segData.size();
+    blockOffsets[(size_t)NB] = blocks.size();
 
     std::string path = segBitmaskPath(index_path, files_per_seg, true);
     FILE* f = fopen(path.c_str(), "wb");
@@ -175,17 +206,17 @@ void saveSegmentBitmaskSparse(const std::string& index_path, int files_per_seg) 
         fprintf(stderr, "saveSegmentBitmaskSparse: cannot write %s\n", path.c_str());
         return;
     }
-    uint64_t header[4] = { SEG_SPARSE_MAGIC, (uint64_t)files_per_seg,
-                           (uint64_t)maxDoc, (uint64_t)segData.size() };
-    fwrite(header, sizeof(uint64_t), 4, f);
-    fwrite(segOffsets.data(), sizeof(uint32_t), segOffsets.size(), f);
-    fwrite(segData.data(), sizeof(uint16_t), segData.size(), f);
+    uint64_t header[8] = { SEG_SPARSE_MAGIC, (uint64_t)files_per_seg, (uint64_t)maxDoc,
+                           (uint64_t)B, NB, totalEntries, (uint64_t)blocks.size(), 0 };
+    fwrite(header, sizeof(uint64_t), 8, f);
+    fwrite(blockOffsets.data(), sizeof(uint64_t), blockOffsets.size(), f);
+    fwrite(blocks.data(), 1, blocks.size(), f);
     fclose(f);
-    double mb = (32 + segOffsets.size() * 4.0 + segData.size() * 2.0) / (1 << 20);
-    printf("Segment bitmask (sparse) saved: fps=%d, segments=%d, %d chunks, "
-           "%zu entries (%.2f seg/chunk), %.1f MB -> %s\n",
-           files_per_seg, numSegments, maxDoc, segData.size(),
-           (double)segData.size() / maxDoc, mb, path.c_str());
+    double mb = (64 + blockOffsets.size() * 8.0 + blocks.size()) / (1 << 20);
+    printf("Segment bitmask (sparse) saved: fps=%d, segments=%d, %d chunks, %llu blocks, "
+           "%llu entries (%.2f seg/chunk), %.1f MB -> %s\n",
+           files_per_seg, numSegments, maxDoc, (unsigned long long)NB,
+           (unsigned long long)totalEntries, (double)totalEntries / maxDoc, mb, path.c_str());
 }
 
 // Read-only, mmap-backed view of a per-chunk segment index in either format:
@@ -198,14 +229,25 @@ struct SegBitmask {
     // dense
     const uint64_t* data = nullptr;   // first chunk's words
     int             words = 1;        // 64-bit words per chunk
-    // sparse
-    const uint32_t* offs = nullptr;   // (count+1) entry offsets
-    const uint16_t* segs = nullptr;   // concatenated sorted segment ids
+    // sparse (blocked): small hot offset table + one streaming region of blocks
+    const uint64_t* blockOffs = nullptr;   // (num_blocks+1) byte offsets into blocks
+    const uint8_t*  blocks    = nullptr;
+    uint32_t        blockChunks = SEG_BLOCK_CHUNKS;
     size_t size()  const { return count; }
     bool   empty() const { return count == 0; }
-    const uint64_t* row(size_t c)      const { return data + c * (size_t)words; }
-    const uint16_t* segBegin(size_t c) const { return segs + offs[c]; }
-    const uint16_t* segEnd(size_t c)   const { return segs + offs[c + 1]; }
+    const uint64_t* row(size_t c) const { return data + c * (size_t)words; }
+    // Locate chunk c's block once; both ends come from the same cache line.
+    const uint16_t* blockLocal(size_t c) const {
+        return reinterpret_cast<const uint16_t*>(blocks + blockOffs[c / blockChunks]);
+    }
+    const uint16_t* segBegin(size_t c) const {
+        const uint16_t* lo = blockLocal(c);
+        return lo + (blockChunks + 1) + lo[c % blockChunks];
+    }
+    const uint16_t* segEnd(size_t c) const {
+        const uint16_t* lo = blockLocal(c);
+        return lo + (blockChunks + 1) + lo[(c % blockChunks) + 1];
+    }
 };
 
 // Map the pre-built segment index (dense or sparse) into memory, once per
@@ -258,11 +300,17 @@ static const SegBitmask& loadSegmentBitmask(const std::string& index_path,
                 sb.count         = (size_t)h[3];
                 sb.data          = h + 4;
             } else if (h[0] == SEG_SPARSE_MAGIC) {
-                sb.sparse        = true;
+                sb.sparse       = true;
                 sb.files_per_seg = (int)h[1];
-                sb.count         = (size_t)h[2];      // num_chunks (h[3] = total entries)
-                sb.offs          = reinterpret_cast<const uint32_t*>(h + 4);
-                sb.segs          = reinterpret_cast<const uint16_t*>(sb.offs + (sb.count + 1));
+                sb.count        = (size_t)h[2];
+                sb.blockChunks  = (uint32_t)h[3];
+                uint64_t numBlocks = h[4];
+                sb.blockOffs    = h + 8;
+                sb.blocks       = reinterpret_cast<const uint8_t*>(sb.blockOffs + (numBlocks + 1));
+            } else if (h[0] == SEG_SPARSE_MAGIC_V1) {
+                fprintf(stderr, "loadSegmentBitmask: %s uses the superseded two-region sparse "
+                                "layout; rebuild it with 'destor -o -P %d -S'\n",
+                        path.c_str(), files_per_seg);
             } else {
                 fprintf(stderr, "loadSegmentBitmask: bad magic in %s\n", path.c_str());
             }
