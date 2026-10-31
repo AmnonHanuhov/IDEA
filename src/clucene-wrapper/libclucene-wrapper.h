@@ -49,6 +49,9 @@ std::vector<std::string> search_query_in_index_not(const QueryPtr& query, std::v
 std::vector<std::string> search_index_complex_query_seg_filter(const std::string& query, const std::string& index, int files_per_seg = 1024, bool sparse = false, SyncQueue* queue = nullptr);
 void saveSegmentBitmask(const std::string& index_path, int files_per_seg = 1024);
 void saveSegmentBitmaskSparse(const std::string& index_path, int files_per_seg = 1024);
+// AND, NOT, the segment filter and the segment index read each chunk's file
+// IDs.  Returns why the configured index cannot provide them, or nullptr.
+const char* chunk_files_unavailable_reason();
 std::vector<std::string> search_keywords_in_index(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_keywords_in_index_and(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::vector<std::string> search_must_keywords_in_index_bitmap(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);

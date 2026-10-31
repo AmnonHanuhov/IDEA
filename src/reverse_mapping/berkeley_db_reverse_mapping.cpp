@@ -452,3 +452,75 @@ void get_db_reverse_mapping_iterate(DBT* data, SyncQueue* queue) {
         sync_queue_push(queue, new std::string(to_insert));
     }
 }
+
+DbReverseMappingReader::DbReverseMappingReader() : db(NULL), cursor(NULL), buffer(1 << 20) {
+    // Read-only, so that a lookup against the wrong reverse-directory fails
+    // here instead of creating an empty mapping and finding nothing.
+    std::string path = DB_REVERSE_MAPPING_PATH;
+    int ret;
+    if ((ret = db_create(&db, NULL, 0)) != 0 ||
+        (ret = db->set_flags(db, DB_DUP)) != 0 ||
+        (ret = db->open(db, NULL, path.c_str(), NULL, DB_HASH, DB_RDONLY, 0)) != 0 ||
+        (ret = db->cursor(db, NULL, &cursor, 0)) != 0) {
+        fprintf(stderr, "cannot open the db reverse mapping %s: %s\n", path.c_str(), db_strerror(ret));
+        exit(1);
+    }
+}
+
+DbReverseMappingReader::~DbReverseMappingReader() {
+    cursor->close(cursor);
+    db->close(db, 0);
+}
+
+// A plain record holds the file ID as decimal text.
+static int32_t parse_file_id(const char* record, size_t size, const std::string& fp) {
+    uint64_t id = 0;
+    size_t i = 0;
+    while (i < size && i < 10 && record[i] >= '0' && record[i] <= '9')
+        id = id * 10 + (record[i++] - '0');
+    if (size == 0 || i != size || id > INT32_MAX) {
+        fprintf(stderr, "db reverse mapping: the record under %s is not a file ID: '%.*s'\n",
+                fp.c_str(), (int)size, record);
+        exit(1);
+    }
+    return (int32_t)id;
+}
+
+size_t DbReverseMappingReader::get_file_ids(const std::string& fp, std::vector<int32_t>& out) {
+    DBT key, data;
+    memset(&key, 0, sizeof(key));
+    memset(&data, 0, sizeof(data));
+    key.data = const_cast<char*>(fp.data());
+    key.size = fp.size();
+    data.data = buffer.data();
+    data.ulen = buffer.size();
+    data.flags = DB_DBT_USERMEM;
+
+    // Each call fills the buffer with as many of fp's records as fit, leaving
+    // the cursor on fp so that DB_NEXT_DUP resumes where the buffer ran out.
+    // The IDs are appended to out at once, so out grows a single time.
+    ids.clear();
+    TIMER_DECLARE(1);
+    TIMER_BEGIN(1);
+    int ret = cursor->get(cursor, &key, &data, DB_SET | DB_MULTIPLE);
+    TIMER_END(1, read_time);
+    while (ret == 0) {
+        void *p, *record;
+        size_t size;
+        for (DB_MULTIPLE_INIT(p, &data);;) {
+            DB_MULTIPLE_NEXT(p, &data, record, size);
+            if (p == NULL)
+                break;
+            ids.push_back(parse_file_id((const char*)record, size, fp));
+        }
+        TIMER_BEGIN(1);
+        ret = cursor->get(cursor, &key, &data, DB_MULTIPLE | DB_NEXT_DUP);
+        TIMER_END(1, read_time);
+    }
+    if (ret != DB_NOTFOUND) {
+        db->err(db, ret, "reading the db reverse mapping under %s", fp.c_str());
+        exit(1);
+    }
+    out.insert(out.end(), ids.begin(), ids.end());
+    return ids.size();
+}
