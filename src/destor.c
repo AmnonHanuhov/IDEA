@@ -167,17 +167,20 @@ char** get_keywords(sds keywords_file, size_t* keywords_num, size_t keyword_leng
 		(*keywords_num) = is_fixed_size_keyword ? (size / keyword_length) : count_lines_of_file(f);
 		keywords = malloc((*keywords_num) * sizeof(sds));
 		fseek(f, 0, SEEK_SET); // seek back to beginning of file
+		size_t read_num = 0;
 		for (int i = 0; i < (*keywords_num); i++){
 			if (is_fixed_size_keyword) {
 				fread(keyword_buff, keyword_length, 1, f);
-				keywords[i] = sdsnewlen(keyword_buff, keyword_length);
+				keywords[read_num++] = sdsnewlen(keyword_buff, keyword_length);
 			}
 			else {
 				fgets(keyword_buff, MAX_KEYWORD_SIZE, f);
-				keyword_buff[strcspn(keyword_buff, "\n")] = '\0';
-				keywords[i] = sdsnew(keyword_buff);
+				keyword_buff[strcspn(keyword_buff, "\r\n")] = '\0';
+				if (keyword_buff[0] != '\0') // skip blank lines
+					keywords[read_num++] = sdsnew(keyword_buff);
 			}
 		}
+		(*keywords_num) = read_num;
 		free(keyword_buff);
 		fclose(f);
 		sdsfree(keywords_file);
@@ -191,8 +194,6 @@ char** get_keywords(sds keywords_file, size_t* keywords_num, size_t keyword_leng
 		fprintf(stderr, "Keywords are required!\n");
 		usage();
 	}
-	// temp fix until I figure out why the last keyword is duplicated
-	*keywords_num = *keywords_num-1;
 	return keywords;
 }
 

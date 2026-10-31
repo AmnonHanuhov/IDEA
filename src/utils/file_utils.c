@@ -7,17 +7,22 @@
 
 int count_lines_of_file(FILE* f)
 {
-	int lines = 1; // there is always one lines that does not have \n after it.
+	int lines = 0;
+	int ch, last = '\n'; // an empty file has no lines
 	fseek(f, 0, SEEK_SET);
-	
-	while (!feof(f))
+
+	while ((ch = fgetc(f)) != EOF)
 	{
-		int ch = fgetc(f);
 		if (ch == '\n')
 		{
 			lines++;
 		}
+		last = ch;
 	}
-	
+	if (last != '\n')
+	{
+		lines++; // the last line has no \n after it
+	}
+
 	return lines;
 }
