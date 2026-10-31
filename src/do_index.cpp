@@ -703,6 +703,15 @@ void do_deduplicated_index() {
 
 	destor_log(DESTOR_NOTICE, "deduplicated index");
 
+	// The logical phase writes the reverse mapping and the pathstore into the
+	// reverse directory, but runs only after the hours-long physical phase.
+	// A missing directory would then abort with the chunk index uncommitted.
+	if (mkdir(destor.reverse_directory, 0755) != 0 && errno != EEXIST) {
+		fprintf(stderr, "cannot create reverse directory %s: %s\n",
+				destor.reverse_directory, strerror(errno));
+		exit(1);
+	}
+
 	TIMER_DECLARE(1);
 	TIMER_BEGIN(1); // total_time
 
@@ -722,8 +731,6 @@ void do_deduplicated_index() {
 	
 	TIMER_END(1, total_time);
 
-	saveSegmentBitmask(std::string(DEDUP_INDEX_DIR));
-
 	puts("==== index end ====");
 
 	double throughput = data_size * 1000000 / (1024.0 * 1024 * total_time);
@@ -741,18 +748,13 @@ void do_deduplicated_index() {
 	uint64_t external_reverse_mapping_size = destor.reverse_mapping_type == EXTERNAL_REVERSE_MAPPING ||
 											 destor.reverse_mapping_type == READ_OPTIMIZED_EXTERNAL_REVERSE_MAPPING ?
 										   dir_size(EXTERNAL_REVERSE_MAPPING_DIR) : 0;
-	uint64_t complete_index_size;
+	// Only the reverse mapping in use has a nonzero size; in-doc keeps its
+	// mapping inside the chunk index.
+	uint64_t complete_index_size = index_size + lucene_reverse_mapping_size +
+								   db_reverse_mapping_size + external_reverse_mapping_size;
 	uint64_t pathstore_size = 0;
 	uint64_t rankstore_size = 0;
 	
-	if (destor.reverse_mapping_type == EXTERNAL_REVERSE_MAPPING ||
-		destor.reverse_mapping_type == READ_OPTIMIZED_EXTERNAL_REVERSE_MAPPING) {
-		complete_index_size = index_size + external_reverse_mapping_size;
-	} else if (destor.reverse_mapping_type == LUCENE_REVERSE_MAPPING) {
-		complete_index_size = index_size + lucene_reverse_mapping_size;
-	} else if (destor.reverse_mapping_type == DB_REVERSE_MAPPING) {
-		complete_index_size = index_size + db_reverse_mapping_size;
-	}
 	if (destor.is_path_indirected) {
 		pathstore_size = file_size(PATHSTORE_PATH);
 		complete_index_size += pathstore_size;
@@ -769,7 +771,7 @@ void do_deduplicated_index() {
 	create_reverse_mapping_time /= 1000000;
 
 	printf("number of files: %" PRId32 "\n", file_num);
-	printf("number of chunks: %" PRId32"\n", jcr.chunk_num);
+	printf("number of chunks: %" PRIu64 "\n", chunk_num);
 	printf("total size(B): %" PRId64 "\n", data_size);
 	printf("total time(s): %.3f\n", total_time);
 	printf("throughput(MB/s): %.2f\n", throughput);
@@ -789,6 +791,13 @@ void do_deduplicated_index() {
 	// index_type,total_time,process_data_time,create_reverse_mapping_time,file_num,chunk_num,data_size,read_recipe_time,read_chunk_time,chunk_index_size,db_reverse_mapping_size,complete_index_size,pathstore_size
 	write_file(index_log_path, "dedup,%.3f,%.3f,%.3f,%u,%u,%llu,%.3f,%.3f,%llu,%llu,%llu,%llu\n", 
 	total_time, process_data_time, create_reverse_mapping_time, file_num, chunk_num, data_size, read_recipe_time, read_chunk_time, index_size, db_reverse_mapping_size, complete_index_size, pathstore_size);
+
+	// The default segment index for -j.  Built last, so that it is neither
+	// timed nor counted in the index size, and cannot cost the log row.
+	if (const char* reason = chunk_files_unavailable_reason())
+		printf("segment index not built: %s\n", reason);
+	else
+		saveSegmentBitmask(std::string(DEDUP_INDEX_DIR));
 }
 
 void do_deduplicated_lookup(unsigned char **keywords, size_t keywords_num) {
@@ -1045,23 +1054,21 @@ void do_deduplicated_lookup_using_parser(const std::string& query) {
 	printf("Number of results: %d\n", found_in_files.size());
 }
 
-// Resolves file IDs to paths via pathstore.
+// Resolves file IDs to paths via pathstore.  The AND and NOT pipelines emit
+// decimal IDs for in-doc and db indexes alike, whatever textual-doc-id says
+// ('reverse-mapping db' turns it off).
 static std::set<std::string> resolve_file_ids(const std::vector<std::string>& file_ids) {
 	init_pathstore();
 	std::set<std::string> paths;
-	for (const auto& id : file_ids) {
-		if (destor.is_textual_doc_id)
-			paths.insert(get_path(std::atoi(id.data())));
-		else
-			paths.insert(get_path(*(uint32_t*)id.data()));
-	}
+	for (const auto& id : file_ids)
+		paths.insert(get_path(std::atoi(id.data())));
 	close_pathstore();
 	return paths;
 }
 
 void do_deduplicated_NOT_lookup(const std::string& query) {
 	/**
-	 * Assuming no offsets, no ranking, in-doc reverse mapping and indirect-path-strings
+	 * Assuming no offsets, no ranking, in-doc or db reverse mapping and indirect-path-strings
 	 */
 	destor_log(DESTOR_NOTICE, "dedup NOT lookup using parser");
 

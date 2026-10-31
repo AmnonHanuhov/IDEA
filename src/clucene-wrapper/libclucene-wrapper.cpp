@@ -3,6 +3,7 @@
 #include "pathstore.h"
 #include "TrackingTermScorer.h"
 #include "TrackingTermScorer2.h"
+#include "berkeley_db_reverse_mapping.h"
 #include <boost/dynamic_bitset.hpp>
 
 #include <sys/stat.h>
@@ -51,6 +52,106 @@ static inline bool segListsDisjoint(const uint16_t* a, const uint16_t* ae,
     return true;
 }
 
+const char* chunk_files_unavailable_reason() {
+    if (destor.reverse_mapping_type != IN_DOC_REVERSE_MAPPING &&
+        destor.reverse_mapping_type != DB_REVERSE_MAPPING)
+        return "the reverse mapping must be in-doc or db";
+    if (!destor.is_path_indirected)
+        return "indirect-path-strings must be yes, so that files have numeric IDs";
+    if (destor.reverse_mapping_type == DB_REVERSE_MAPPING &&
+        (destor.offsets_mode != NO_OFFSETS || destor.tf_idf))
+        return "a db reverse mapping must be built with offsets-mode none and tf-idf no";
+    return nullptr;
+}
+
+// The IDs of the files that contain a chunk, wherever the index keeps them:
+//   in-doc: the chunk's Lucene document stores them as its 'name' values;
+//   db:     it stores the chunk fingerprint, under which the Berkeley DB
+//           reverse mapping stores them.
+// Both list a file once per occurrence of the chunk in it.  Fetch time is
+// split between the Lucene document store and the reverse mapping; in both
+// modes converting the stored IDs to integers is not timed.
+class ChunkFileResolver {
+public:
+    explicit ChunkFileResolver(const IndexReaderPtr& reader) : reader(reader) {
+        if (const char* reason = chunk_files_unavailable_reason()) {
+            fprintf(stderr, "cannot read the files of a chunk: %s\n", reason);
+            exit(1);
+        }
+        if (destor.reverse_mapping_type == DB_REVERSE_MAPPING) {
+            TIMER_DECLARE(1);
+            TIMER_BEGIN(1);
+            reverse_mapping.reset(new DbReverseMappingReader());
+            TIMER_END(1, open_time);
+        }
+    }
+
+    // Appends the IDs of the files that contain chunk docId to out.
+    void fetch(int32_t docId, std::vector<int32_t>& out) {
+        static const std::wstring nameField = toWstring("name");
+        TIMER_DECLARE(1);
+        TIMER_BEGIN(1);
+        DocumentPtr document = reader->document(docId);
+        if (reverse_mapping) {
+            std::string fp = StringUtils::toUTF8(document->get(nameField));
+            TIMER_END(1, doc_store_time);
+            reverse_mapping->get_file_ids(fp, out);
+        } else {
+            const auto& fileIDs = document->getValues(nameField);
+            TIMER_END(1, doc_store_time);
+            out.reserve(out.size() + fileIDs.size());
+            for (const auto& fileID : fileIDs)
+                out.push_back(std::stoi(fileID));
+        }
+    }
+
+    // Microseconds; all zero for in-doc except the document store.
+    double reverse_mapping_time() const { return reverse_mapping ? reverse_mapping->read_time : 0; }
+    double doc_store_time = 0;
+    double open_time = 0;              // opening the reverse mapping
+
+private:
+    IndexReaderPtr reader;
+    std::unique_ptr<DbReverseMappingReader> reverse_mapping;
+};
+
+// Every chunk's file IDs in CSR form: chunk d's are
+// flatFiles[offsets[d] .. offsets[d + 1]).  Deleted chunks have none.
+struct ChunkFiles {
+    std::vector<uint32_t> flatFiles;
+    std::vector<uint64_t> offsets;
+    uint32_t maxFid = 0;
+    int32_t  maxDoc = 0;
+};
+
+// One pass over the chunks of the index at index_path, decoding each chunk's
+// file list once.  For a db index every chunk is a reverse-mapping lookup.
+static ChunkFiles readChunkFiles(const std::string& index_path) {
+    auto reader = IndexReader::open(FSDirectory::open(toWstring(index_path)));
+    ChunkFiles cf;
+    cf.maxDoc = reader->maxDoc();
+    cf.offsets.assign((size_t)cf.maxDoc + 1, 0);
+    cf.flatFiles.reserve((size_t)cf.maxDoc * 4);
+    {
+        ChunkFileResolver resolver(reader);
+        std::vector<int32_t> fileIDs;
+        for (int32_t docId = 0; docId < cf.maxDoc; ++docId) {
+            cf.offsets[docId] = cf.flatFiles.size();
+            if (reader->isDeleted(docId)) continue;
+            fileIDs.clear();
+            resolver.fetch(docId, fileIDs);
+            for (size_t i = 0; i < fileIDs.size(); ++i) {
+                uint32_t f = (uint32_t)fileIDs[i];
+                cf.flatFiles.push_back(f);
+                if (f > cf.maxFid) cf.maxFid = f;
+            }
+        }
+    }
+    cf.offsets[cf.maxDoc] = cf.flatFiles.size();
+    reader->close();
+    return cf;
+}
+
 // Build and persist a per-chunk segment bitmask at a chosen granularity.
 //
 // A segment is a block of `files_per_seg` consecutive file IDs; a chunk's mask
@@ -64,28 +165,13 @@ static inline bool segListsDisjoint(const uint16_t* a, const uint16_t* ae,
 // yields the max file ID (hence the word count) — then bits are set in memory.
 void saveSegmentBitmask(const std::string& index_path, int files_per_seg) {
     if (files_per_seg <= 0) files_per_seg = DEFAULT_FILES_PER_SEG;
-    auto reader = IndexReader::open(FSDirectory::open(toWstring(index_path)));
-    int32_t maxDoc = reader->maxDoc();
-    static const std::wstring nameField = toWstring("name");
 
     // Pass 1 (decode once): gather per-chunk file IDs into CSR form + max file ID.
-    std::vector<uint32_t> flatFiles;
-    std::vector<uint64_t> offsets((size_t)maxDoc + 1, 0);
-    flatFiles.reserve((size_t)maxDoc * 4);
-    uint32_t maxFid = 0;
-    for (int32_t docId = 0; docId < maxDoc; ++docId) {
-        offsets[docId] = flatFiles.size();
-        if (reader->isDeleted(docId)) continue;
-        DocumentPtr doc = reader->document(docId);
-        const auto& fileIDs = doc->getValues(nameField);
-        for (size_t i = 0; i < fileIDs.size(); ++i) {
-            uint32_t f = (uint32_t)std::stoul(fileIDs[i]);
-            flatFiles.push_back(f);
-            if (f > maxFid) maxFid = f;
-        }
-    }
-    offsets[maxDoc] = flatFiles.size();
-    reader->close();
+    const ChunkFiles cf = readChunkFiles(index_path);
+    const std::vector<uint32_t>& flatFiles = cf.flatFiles;
+    const std::vector<uint64_t>& offsets = cf.offsets;
+    const int32_t maxDoc = cf.maxDoc;
+    const uint32_t maxFid = cf.maxFid;
 
     int numSegments = (int)(maxFid / (uint32_t)files_per_seg) + 1;
     int words = (numSegments + 63) / 64;
@@ -133,28 +219,13 @@ void saveSegmentBitmask(const std::string& index_path, int files_per_seg) {
 // forward stream.  Local uint16 offsets also cost less than global uint32 ones.
 void saveSegmentBitmaskSparse(const std::string& index_path, int files_per_seg) {
     if (files_per_seg <= 0) files_per_seg = DEFAULT_FILES_PER_SEG;
-    auto reader = IndexReader::open(FSDirectory::open(toWstring(index_path)));
-    int32_t maxDoc = reader->maxDoc();
-    static const std::wstring nameField = toWstring("name");
 
     // Pass 1 (decode once): per-chunk file IDs into CSR form + max file ID.
-    std::vector<uint32_t> flatFiles;
-    std::vector<uint64_t> offsets((size_t)maxDoc + 1, 0);
-    flatFiles.reserve((size_t)maxDoc * 4);
-    uint32_t maxFid = 0;
-    for (int32_t docId = 0; docId < maxDoc; ++docId) {
-        offsets[docId] = flatFiles.size();
-        if (reader->isDeleted(docId)) continue;
-        DocumentPtr doc = reader->document(docId);
-        const auto& fileIDs = doc->getValues(nameField);
-        for (size_t i = 0; i < fileIDs.size(); ++i) {
-            uint32_t f = (uint32_t)std::stoul(fileIDs[i]);
-            flatFiles.push_back(f);
-            if (f > maxFid) maxFid = f;
-        }
-    }
-    offsets[maxDoc] = flatFiles.size();
-    reader->close();
+    const ChunkFiles cf = readChunkFiles(index_path);
+    const std::vector<uint32_t>& flatFiles = cf.flatFiles;
+    const std::vector<uint64_t>& offsets = cf.offsets;
+    const int32_t maxDoc = cf.maxDoc;
+    const uint32_t maxFid = cf.maxFid;
 
     int numSegments = (int)(maxFid / (uint32_t)files_per_seg) + 1;
     if (numSegments > 65535) {
@@ -188,6 +259,12 @@ void saveSegmentBitmaskSparse(const std::string& index_path, int files_per_seg) 
             tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
             blockSegs.insert(blockSegs.end(), tmp.begin(), tmp.end());
             entries += (uint32_t)tmp.size();
+        }
+        if (entries > 65535) {   // the local offsets are uint16
+            fprintf(stderr, "saveSegmentBitmaskSparse: block %llu holds %u segment ids, more than "
+                            "its uint16 offsets address; use a larger files-per-seg.\n",
+                    (unsigned long long)b, entries);
+            return;
         }
         local[B] = (uint16_t)entries;
         totalEntries += entries;
@@ -428,16 +505,16 @@ public:
 		size_t num_keywords) {
 
 		TIMER_DECLARE(2);
-		TIMER_DECLARE(5);
 		TIMER_DECLARE(6);
 		TIMER_DECLARE(7);
-		double total_accessing_docs_in_bitmap_time = 0, total_docs_file_marking_time = 0, total_docs_fetch_files_time = 0, file_coverage_check_time = 0;
+		double total_accessing_docs_in_bitmap_time = 0, total_docs_file_marking_time = 0, file_coverage_check_time = 0;
 		std::vector<std::string> results;
 		std::unordered_map<int32_t, boost::dynamic_bitset<>> fileBitmaps;
 
 		std::cout << "Number of chunks: " << m_docIds.size() << ", " << docBitmaps->size() << std::endl;
 
-		static const std::wstring nameField = toWstring("name");
+		ChunkFileResolver chunkFiles(searcher->getIndexReader());
+		std::vector<int32_t> fileIDs;
 
 		for (auto doc : m_docIds) {
 			TIMER_BEGIN(7);
@@ -449,16 +526,12 @@ public:
 			const auto& chunkBitmap = it->second;
 			TIMER_END(7, total_accessing_docs_in_bitmap_time);
 
-			TIMER_BEGIN(5);
-			DocumentPtr document = searcher->doc(doc);
-			const auto& filenames = document->getValues(nameField);
-			TIMER_END(5, total_docs_fetch_files_time);
+			fileIDs.clear();
+			chunkFiles.fetch(doc, fileIDs);
 			std::cout << "doc: " << doc << std::endl;
 			TIMER_BEGIN(2);
-			for (const auto& filename : filenames) {
-				std::cout << "file: " << StringUtils::toUTF8(filename) << std::endl;
-				std::string utf8Filename = StringUtils::toUTF8(filename);
-				int file_id = std::stoi(utf8Filename);
+			for (int file_id : fileIDs) {
+				std::cout << "file: " << file_id << std::endl;
 
 				// Create or get existing bitmap for this file
 				auto& fileBitmap = fileBitmaps.emplace(file_id, chunkBitmap.size()).first->second;
@@ -486,7 +559,9 @@ public:
 		TIMER_END(6, file_coverage_check_time);
 
 		printf("accessing docs in bitmap time: %.3f\n", total_accessing_docs_in_bitmap_time / 1000000);
-		printf("fetch files time: %.3f\n", total_docs_fetch_files_time / 1000000);
+		printf("fetch files time: %.3f\n", (chunkFiles.doc_store_time + chunkFiles.reverse_mapping_time()) / 1000000);
+		printf("reverse mapping time: %.3f\n", chunkFiles.reverse_mapping_time() / 1000000);
+		printf("reverse mapping open time: %.3f\n", chunkFiles.open_time / 1000000);
 		printf("file marking time: %.3f\n", total_docs_file_marking_time / 1000000);
 		printf("file coverage check time: %.3f\n", file_coverage_check_time / 1000000);
 
@@ -618,13 +693,11 @@ public:
 	{
 		TIMER_DECLARE(1);
 		TIMER_DECLARE(2);
-		TIMER_DECLARE(3);
 		TIMER_DECLARE(4);
 
 		double total_sorting_keywords_time = 0;
 		double total_and_time              = 0;   // count-advancing AND intersection
 		double total_not_time              = 0;   // NOT filter + result gathering
-		double total_fetch_files_time      = 0;
 
 		std::vector<std::string> results;
 		bool no_common_files = false;
@@ -673,11 +746,10 @@ public:
 			if (i > 0) and_eligible_chunks += n;
 		}
 
-		static const std::wstring nameField = toWstring("name");
-
 		// --- Caches / state ---
 		ChunkToFilesMap chunkToFiles;   // chunkID -> vector<int32_t> fileIds
 		SegmentedFileCounts fileState;  // fileId  -> seenCount
+		ChunkFileResolver chunkFiles(searcher->getIndexReader());
 
 		// Helper: fetch and cache file IDs for a chunk
 		auto get_files_for_chunk = [&](int32_t chunkID) -> const std::vector<int32_t>& {
@@ -686,20 +758,10 @@ public:
 				return it->second; // cache hit
 			}
 
-			TIMER_BEGIN(3);
-			DocumentPtr document = searcher->doc(chunkID);
-			const auto& fileIDs  = document->getValues(nameField);
-			TIMER_END(3, total_fetch_files_time);
+			std::vector<int32_t> files;
+			chunkFiles.fetch(chunkID, files);
 
 			++num_chunks_fetched;
-
-			std::vector<int32_t> files;
-			files.reserve(fileIDs.size());
-			for (size_t i = 0; i < fileIDs.size(); ++i) {
-				const std::wstring& w = fileIDs[i];
-				int32_t fileId = std::stoi(w);
-				files.push_back(fileId);
-			}
 			num_files_fetched += (uint32_t)files.size();
 
 			auto inserted = chunkToFiles.insert(std::make_pair(chunkID, std::move(files)));
@@ -922,7 +984,9 @@ public:
 		printf("AND evaluation time: %.3f\n", total_and_time / 1000000.0);
 		printf("NOT evaluation time: %.3f\n", total_not_time / 1000000.0);
 		printf("AND+NOT evaluation time: %.3f\n", (total_and_time + total_not_time) / 1000000.0);
-		printf("Fetch files time: %.3f\n", total_fetch_files_time / 1000000.0);
+		printf("Fetch files time: %.3f\n", (chunkFiles.doc_store_time + chunkFiles.reverse_mapping_time()) / 1000000.0);
+		printf("Reverse mapping time: %.3f\n", chunkFiles.reverse_mapping_time() / 1000000.0);
+		printf("Reverse mapping open time: %.3f\n", chunkFiles.open_time / 1000000.0);
 
 		return results;
 	}
@@ -1182,6 +1246,21 @@ std::vector<std::string> search_index_complex_query_seg_filter(const std::string
 		TIMER_BEGIN(5);
 		const SegBitmask& seg_bitmask = loadSegmentBitmask(index, files_per_seg, sparse);
 		TIMER_END(5, seg_build_time);
+
+		// This query is the filtered one, so running it without its segment
+		// index would only look like a result; and one built for another state
+		// of the index would skip chunks on behalf of files it does not know.
+		if (seg_bitmask.empty() && searcher->maxDoc() > 0) {
+			fprintf(stderr, "no usable segment index; build it with 'destor -o -P %d%s'\n",
+			        files_per_seg, sparse ? " -S" : "");
+			exit(1);
+		}
+		if (!seg_bitmask.empty() && seg_bitmask.size() != (size_t)searcher->maxDoc()) {
+			fprintf(stderr, "%s covers %zu chunks but the index has %d; rebuild it with 'destor -o -P %d%s'\n",
+			        segBitmaskPath(index, seg_bitmask.files_per_seg, sparse).c_str(),
+			        seg_bitmask.size(), searcher->maxDoc(), seg_bitmask.files_per_seg, sparse ? " -S" : "");
+			exit(1);
+		}
 
 		TIMER_BEGIN(1);
 		searcher->search(new_query, nullptr, collector);
