@@ -4,6 +4,7 @@
 #include "TrackingTermScorer.h"
 #include "TrackingTermScorer2.h"
 #include "berkeley_db_reverse_mapping.h"
+#include "ReaderUtil.h"
 #include <boost/dynamic_bitset.hpp>
 
 #include <sys/stat.h>
@@ -12,6 +13,9 @@
 #include <sys/resource.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
 
 #include <iostream>
 #include <algorithm>
@@ -26,6 +30,39 @@
 #include <unordered_set>
 
 double searcher_load_time = 0, dtor_time = 0;
+
+void reset_query_timers() {
+    searcher_load_time = 0;
+    dtor_time = 0;
+}
+
+// The searchers the query server (destor --serve) opens at startup, by index
+// path.  Empty in one-shot runs, where every query opens its index.
+static std::unordered_map<std::string, IndexSearcherPtr> resident_searchers;
+
+static IndexSearcherPtr open_searcher(const std::string& index) {
+    auto it = resident_searchers.find(index);
+    if (it != resident_searchers.end())
+        return it->second;
+    return newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+}
+
+int32_t open_resident_index(const std::string& index) {
+    IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+    // Opening reads the term index, field infos and deletions.  Norms are read
+    // by the first query that scores a field; read them now instead, from each
+    // segment, which is where the searcher asks for them.
+    Collection<IndexReaderPtr> segments = Collection<IndexReaderPtr>::newInstance();
+    ReaderUtil::gatherSubReaders(segments, searcher->getIndexReader());
+    for (const auto& segment : segments) {
+        HashSet<String> fields = segment->getFieldNames(IndexReader::FIELD_OPTION_INDEXED);
+        for (const auto& field : fields)
+            if (segment->hasNorms(field))
+                segment->norms(field);
+    }
+    resident_searchers[index] = searcher;
+    return searcher->maxDoc();
+}
 
 static const uint32_t DEFAULT_FILES_PER_SEG = 1024;
 static const uint64_t SEG_BITMASK_MAGIC = 0x5345474D41534B32ULL; // "SEGMASK2" (dense)
@@ -64,6 +101,16 @@ const char* chunk_files_unavailable_reason() {
     return nullptr;
 }
 
+// The db reverse mapping as the query server (destor --serve) opens it at
+// startup, shared by all its queries; null in one-shot runs, where each query
+// opens its own.
+static std::unique_ptr<DbReverseMappingReader> resident_reverse_mapping;
+
+void open_resident_reverse_mapping() {
+    if (destor.reverse_mapping_type == DB_REVERSE_MAPPING && !resident_reverse_mapping)
+        resident_reverse_mapping.reset(new DbReverseMappingReader());
+}
+
 // The IDs of the files that contain a chunk, wherever the index keeps them:
 //   in-doc: the chunk's Lucene document stores them as its 'name' values;
 //   db:     it stores the chunk fingerprint, under which the Berkeley DB
@@ -79,10 +126,17 @@ public:
             exit(1);
         }
         if (destor.reverse_mapping_type == DB_REVERSE_MAPPING) {
-            TIMER_DECLARE(1);
-            TIMER_BEGIN(1);
-            reverse_mapping.reset(new DbReverseMappingReader());
-            TIMER_END(1, open_time);
+            if (resident_reverse_mapping) {
+                reverse_mapping = resident_reverse_mapping.get();
+            } else {
+                TIMER_DECLARE(1);
+                TIMER_BEGIN(1);
+                owned_reverse_mapping.reset(new DbReverseMappingReader());
+                reverse_mapping = owned_reverse_mapping.get();
+                TIMER_END(1, open_time);
+            }
+            // A resident reader has already timed earlier queries' reads.
+            read_time_before = reverse_mapping->read_time;
         }
     }
 
@@ -106,13 +160,17 @@ public:
     }
 
     // Microseconds; all zero for in-doc except the document store.
-    double reverse_mapping_time() const { return reverse_mapping ? reverse_mapping->read_time : 0; }
+    double reverse_mapping_time() const {
+        return reverse_mapping ? reverse_mapping->read_time - read_time_before : 0;
+    }
     double doc_store_time = 0;
     double open_time = 0;              // opening the reverse mapping
 
 private:
     IndexReaderPtr reader;
-    std::unique_ptr<DbReverseMappingReader> reverse_mapping;
+    DbReverseMappingReader* reverse_mapping = nullptr;
+    std::unique_ptr<DbReverseMappingReader> owned_reverse_mapping;
+    double read_time_before = 0;
 };
 
 // Every chunk's file IDs in CSR form: chunk d's are
@@ -310,6 +368,9 @@ struct SegBitmask {
     const uint64_t* blockOffs = nullptr;   // (num_blocks+1) byte offsets into blocks
     const uint8_t*  blocks    = nullptr;
     uint32_t        blockChunks = SEG_BLOCK_CHUNKS;
+    // the whole file as mapped
+    const void*     map = nullptr;
+    size_t          map_size = 0;
     size_t size()  const { return count; }
     bool   empty() const { return count == 0; }
     const uint64_t* row(size_t c) const { return data + c * (size_t)words; }
@@ -347,9 +408,13 @@ static const SegBitmask& loadSegmentBitmask(const std::string& index_path,
         return cache.emplace(path, sb).first->second;
     }
     struct stat st;
+    void* addr_or_null = nullptr;
+    size_t map_size = 0;
     if (fstat(fd, &st) == 0 && st.st_size > (off_t)(4 * sizeof(uint64_t))) {
         void* addr = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
         if (addr != MAP_FAILED) {
+            addr_or_null = addr;
+            map_size = (size_t)st.st_size;
             // Both phases walk chunk ids in ascending order, so the mapping is
             // read as a forward stream.  Say so: without the hint the kernel
             // sizes its readahead window from the fault pattern alone, and a
@@ -396,7 +461,27 @@ static const SegBitmask& loadSegmentBitmask(const std::string& index_path,
         }
     }
     close(fd);   // mapping stays valid after the fd is closed
+    sb.map = addr_or_null;
+    sb.map_size = map_size;
     return cache.emplace(path, sb).first->second;
+}
+
+// For the query server: map the segment index, read all of it and lock it in
+// memory, so that no query faults on it and drop_caches cannot evict it.
+// Returns the bytes locked, or -1 if the index is missing or unusable.
+long long preload_segment_index(const std::string& index_path, int files_per_seg, bool sparse) {
+    const SegBitmask& sb = loadSegmentBitmask(index_path, files_per_seg, sparse);
+    if (sb.empty() || !sb.map)
+        return -1;
+    // WILLNEED starts the whole file's readahead at once; mlock then waits
+    // for it and faults every page in.
+    madvise(const_cast<void*>(sb.map), sb.map_size, MADV_WILLNEED);
+    if (mlock(sb.map, sb.map_size) != 0) {
+        fprintf(stderr, "cannot lock %s in memory: %s\n",
+                segBitmaskPath(index_path, files_per_seg, sparse).c_str(), strerror(errno));
+        return -1;
+    }
+    return (long long)sb.map_size;
 }
 
 extern int job;
@@ -494,7 +579,7 @@ public:
 			}
 		}
 		TIMER_END(7, total_docs_fetch_files_time);
-		printf("fetch files time: %.3f\n", total_docs_fetch_files_time / 1000000);
+		printf("fetch files time: %.6f\n", total_docs_fetch_files_time / 1000000);
 		std::cout << "Number of files before filtering: "<< results.size() << std::endl;
 		return results;
 	}
@@ -980,13 +1065,13 @@ public:
 		}
 		printf("AND major faults: %ld\n", majflt_and);
 		printf("NOT major faults: %ld\n", majflt_not);
-		printf("Sorting included terms time: %.3f\n", total_sorting_keywords_time / 1000000.0);
-		printf("AND evaluation time: %.3f\n", total_and_time / 1000000.0);
-		printf("NOT evaluation time: %.3f\n", total_not_time / 1000000.0);
-		printf("AND+NOT evaluation time: %.3f\n", (total_and_time + total_not_time) / 1000000.0);
-		printf("Fetch files time: %.3f\n", (chunkFiles.doc_store_time + chunkFiles.reverse_mapping_time()) / 1000000.0);
-		printf("Reverse mapping time: %.3f\n", chunkFiles.reverse_mapping_time() / 1000000.0);
-		printf("Reverse mapping open time: %.3f\n", chunkFiles.open_time / 1000000.0);
+		printf("Sorting included terms time: %.6f\n", total_sorting_keywords_time / 1000000.0);
+		printf("AND evaluation time: %.6f\n", total_and_time / 1000000.0);
+		printf("NOT evaluation time: %.6f\n", total_not_time / 1000000.0);
+		printf("AND+NOT evaluation time: %.6f\n", (total_and_time + total_not_time) / 1000000.0);
+		printf("Fetch files time: %.6f\n", (chunkFiles.doc_store_time + chunkFiles.reverse_mapping_time()) / 1000000.0);
+		printf("Reverse mapping time: %.6f\n", chunkFiles.reverse_mapping_time() / 1000000.0);
+		printf("Reverse mapping open time: %.6f\n", chunkFiles.open_time / 1000000.0);
 
 		return results;
 	}
@@ -1240,7 +1325,7 @@ std::vector<std::string> search_index_complex_query_seg_filter(const std::string
 	TIMER_DECLARE(1); TIMER_DECLARE(2); TIMER_DECLARE(3); TIMER_DECLARE(4); TIMER_DECLARE(5);
 	{
 		TIMER_BEGIN(3);
-		IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+		IndexSearcherPtr searcher = open_searcher(index);
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(5);
@@ -1274,11 +1359,11 @@ std::vector<std::string> search_index_complex_query_seg_filter(const std::string
 		TIMER_BEGIN(4);
 	}
 	TIMER_END(4, dtor_time);
-	printf("searcher load time: %.3f\n", searcher_load_time / 1000000);
-	printf("seg filter load time: %.3f\n", seg_build_time / 1000000);
-	printf("doc lookup time: %.3f\n", doc_id_lookup_time / 1000000);
-	printf("doc fetch lookup time: %.3f\n", doc_fetch_lookup_time / 1000000);
-	printf("destructors' time: %.3f\n", dtor_time / 1000000);
+	printf("searcher load time: %.6f\n", searcher_load_time / 1000000);
+	printf("seg filter load time: %.6f\n", seg_build_time / 1000000);
+	printf("doc lookup time: %.6f\n", doc_id_lookup_time / 1000000);
+	printf("doc fetch lookup time: %.6f\n", doc_fetch_lookup_time / 1000000);
+	printf("destructors' time: %.6f\n", dtor_time / 1000000);
 	return results;
 }
 
@@ -1396,7 +1481,7 @@ std::vector<std::string> search_query_in_index(const QueryPtr& query, const std:
 	TIMER_DECLARE(4);
 	{
 		TIMER_BEGIN(3);
-		IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+		IndexSearcherPtr searcher = open_searcher(index);
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(1);
@@ -1414,10 +1499,10 @@ std::vector<std::string> search_query_in_index(const QueryPtr& query, const std:
 	}
 	TIMER_END(4, dtor_time);
 	dtor_time /= 1000000;
-	printf("searcher load time: %.3f\n", searcher_load_time / 1000000);
-	printf("doc lookup time: %.3f\n", doc_id_lookup_time / 1000000);
-	printf("doc fetch lookup time: %.3f\n", doc_fetch_lookup_time / 1000000);
-	printf("destructors' time: %.3f\n", dtor_time);
+	printf("searcher load time: %.6f\n", searcher_load_time / 1000000);
+	printf("doc lookup time: %.6f\n", doc_id_lookup_time / 1000000);
+	printf("doc fetch lookup time: %.6f\n", doc_fetch_lookup_time / 1000000);
+	printf("destructors' time: %.6f\n", dtor_time);
 	return results;
 }
 
@@ -1431,7 +1516,7 @@ std::vector<std::string> search_query_in_index_tracking_bitmap(const QueryPtr& q
 	TIMER_DECLARE(4);
 	{
 		TIMER_BEGIN(3);
-		IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+		IndexSearcherPtr searcher = open_searcher(index);
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(1);
@@ -1483,7 +1568,7 @@ std::vector<std::string> search_query_in_index_tracking_vector(const QueryPtr& q
 	TIMER_DECLARE(4);
 	{
 		TIMER_BEGIN(3);
-		IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+		IndexSearcherPtr searcher = open_searcher(index);
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(1);
@@ -1527,7 +1612,7 @@ std::vector<std::string> search_query_in_index_not(const QueryPtr& query, std::v
 	TIMER_DECLARE(4);
 	{
 		TIMER_BEGIN(3);
-		IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+		IndexSearcherPtr searcher = open_searcher(index);
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(1);
@@ -1549,10 +1634,10 @@ std::vector<std::string> search_query_in_index_not(const QueryPtr& query, std::v
 	}
 	TIMER_END(4, dtor_time);
 	dtor_time /= 1000000;
-	printf("searcher load time: %.3f\n", searcher_load_time / 1000000);
-	printf("doc lookup time: %.3f\n", doc_id_lookup_time / 1000000);
-	printf("doc fetch lookup time: %.3f\n", doc_fetch_lookup_time / 1000000);
-	printf("destructors' time: %.3f\n", dtor_time);
+	printf("searcher load time: %.6f\n", searcher_load_time / 1000000);
+	printf("doc lookup time: %.6f\n", doc_id_lookup_time / 1000000);
+	printf("doc fetch lookup time: %.6f\n", doc_fetch_lookup_time / 1000000);
+	printf("destructors' time: %.6f\n", dtor_time);
 	return results;
 }
 
@@ -1585,7 +1670,7 @@ std::map<std::string, std::vector<uint64_t>> search_keywords_in_index_with_tv_of
 	TIMER_DECLARE(4);
 	{
 		TIMER_BEGIN(3);
-		IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+		IndexSearcherPtr searcher = open_searcher(index);
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(1);
@@ -1636,7 +1721,7 @@ std::map<std::string, double> search_keywords_in_index_with_scores(const std::ve
 	TIMER_DECLARE(4);
 	{
 		TIMER_BEGIN(3);
-		IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+		IndexSearcherPtr searcher = open_searcher(index);
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(1);
@@ -1691,7 +1776,7 @@ std::map<std::string, uint32_t> search_keywords_in_index_with_termfreqs(const st
 	TIMER_DECLARE(4);
 	{
 		TIMER_BEGIN(3);
-		IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+		IndexSearcherPtr searcher = open_searcher(index);
 		TIMER_END(3, searcher_load_time);
 
 		TIMER_BEGIN(1);
@@ -1778,7 +1863,7 @@ void create_directories(const std::string& path) {
 }
 
 void print_terms(const std::string& index) {
-	IndexSearcherPtr searcher = newLucene<IndexSearcher>(FSDirectory::open(toWstring(index)));
+	IndexSearcherPtr searcher = open_searcher(index);
     auto indexReader = searcher->getIndexReader();
     TermEnumPtr terms = indexReader->terms();
 

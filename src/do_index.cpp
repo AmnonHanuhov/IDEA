@@ -22,6 +22,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <algorithm>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <sys/resource.h>
+#include <sys/stat.h>
 
 #define MAX_UINT_8 255
 SyncQueue *restore_container_queue;
@@ -387,7 +392,7 @@ void do_naive_lookup_using_parser(const std::string& query) {
 	}
 	fclose(results_file);
 	total_lookup_time /= 1000000;
-	printf("lookup time: %.3f\n", total_lookup_time);
+	printf("lookup time: %.6f\n", total_lookup_time);
 	printf("Number of results: %d\n", results.size());
 }
 
@@ -1057,12 +1062,17 @@ void do_deduplicated_lookup_using_parser(const std::string& query) {
 // Resolves file IDs to paths via pathstore.  The AND and NOT pipelines emit
 // decimal IDs for in-doc and db indexes alike, whatever textual-doc-id says
 // ('reverse-mapping db' turns it off).
+// The query server keeps the pathstore open from startup.
+static bool pathstore_resident = false;
+
 static std::set<std::string> resolve_file_ids(const std::vector<std::string>& file_ids) {
-	init_pathstore();
+	if (!pathstore_resident)
+		init_pathstore();
 	std::set<std::string> paths;
 	for (const auto& id : file_ids)
 		paths.insert(get_path(std::atoi(id.data())));
-	close_pathstore();
+	if (!pathstore_resident)
+		close_pathstore();
 	return paths;
 }
 
@@ -1096,9 +1106,9 @@ void do_deduplicated_NOT_lookup(const std::string& query) {
 	index_lookup_time /= 1000000;
 	indirection_time /= 1000000;
 
-	printf("lookup time: %.3f\n", total_lookup_time);
-	printf("index lookup time: %.3f\n", index_lookup_time);
-	printf("indirection time: %.3f\n", indirection_time);
+	printf("lookup time: %.6f\n", total_lookup_time);
+	printf("index lookup time: %.6f\n", index_lookup_time);
+	printf("indirection time: %.6f\n", indirection_time);
 	printf("Number of results: %d\n", found_in_files.size());
 }
 
@@ -1123,11 +1133,164 @@ void do_deduplicated_NOT_lookup_seg_filter(const std::string& query, int files_p
 	total_lookup_time /= 1000000;
 	index_lookup_time /= 1000000;
 	indirection_time  /= 1000000;
-	printf("lookup time: %.3f\n", total_lookup_time);
-	printf("index lookup time: %.3f\n", index_lookup_time);
-	printf("indirection time: %.3f\n", indirection_time);
+	printf("lookup time: %.6f\n", total_lookup_time);
+	printf("index lookup time: %.6f\n", index_lookup_time);
+	printf("indirection time: %.6f\n", indirection_time);
 	printf("Number of results: %d\n", (int)found_in_files.size());
 	puts("==== deduplicated NOT lookup (seg filter) end ====");
+}
+
+// This process's major and minor faults, and the bytes it caused to be read
+// from storage.
+struct ProcessIo {
+	long majflt = 0, minflt = 0;
+	long long read_bytes = 0;
+};
+
+static ProcessIo process_io() {
+	ProcessIo io;
+	struct rusage ru;
+	getrusage(RUSAGE_SELF, &ru);
+	io.majflt = ru.ru_majflt;
+	io.minflt = ru.ru_minflt;
+	std::ifstream f("/proc/self/io");
+	std::string key;
+	long long value;
+	while (f >> key >> value)
+		if (key == "read_bytes:")
+			io.read_bytes = value;
+	return io;
+}
+
+// Answers queries from stdin with the indexes and their companion structures
+// opened once, as a deployed search service would, instead of every query
+// paying to open them.  At startup it opens the dedup index and, if present,
+// the naive index (term index, field infos, deletions and norms), the db
+// reverse mapping and the pathstore, and reads each segment index named in
+// seg_spec into memory and locks it there.  seg_spec lists them as
+// <files per segment><d|s>, comma-separated: "1024d,64s".  What a query reads
+// beyond that -- postings, stored fields, reverse-mapping and pathstore
+// pages -- comes from the page cache or the disk as before.
+//
+// One request per line; fields are separated by blanks, the query is the rest
+// of the line:
+//     i <query>                      dedup NOT lookup (as -i)
+//     j <files/seg> <d|s> <query>    dedup NOT lookup with a segment filter (as -j)
+//     k <query>                      naive lookup (as -k)
+//     quit
+// A request prints what the one-shot run prints, then this request's faults
+// and storage reads, then a line "==== QUERY END ====".  Startup ends with a
+// line "==== SERVER READY ====".
+void do_serve(const char* seg_spec) {
+	TIMER_DECLARE(1);
+	double t = 0;
+
+	TIMER_BEGIN(1);
+	int32_t chunks = open_resident_index(DEDUP_INDEX_DIR);
+	TIMER_END(1, t);
+	printf("startup: dedup index open time: %.6f (%d documents)\n", t / 1000000, chunks);
+
+	struct stat st;
+	bool have_naive = stat((std::string(NAIVE_INDEX_DIR) + "/segments.gen").c_str(), &st) == 0;
+	if (have_naive) {
+		t = 0;
+		TIMER_BEGIN(1);
+		int32_t docs = open_resident_index(NAIVE_INDEX_DIR);
+		TIMER_END(1, t);
+		printf("startup: naive index open time: %.6f (%d documents)\n", t / 1000000, docs);
+	}
+
+	t = 0;
+	TIMER_BEGIN(1);
+	open_resident_reverse_mapping();
+	init_pathstore();
+	pathstore_resident = true;
+	TIMER_END(1, t);
+	printf("startup: reverse mapping and pathstore open time: %.6f\n", t / 1000000);
+
+	std::set<std::pair<int, bool>> seg_loaded;
+	std::stringstream specs(seg_spec ? seg_spec : "");
+	std::string spec;
+	while (std::getline(specs, spec, ',')) {
+		if (spec.empty())
+			continue;
+		char format = spec.back();
+		int files_per_seg = atoi(spec.c_str());
+		if (files_per_seg <= 0 || (format != 'd' && format != 's')) {
+			fprintf(stderr, "bad segment index '%s': expected <files per segment><d|s>\n", spec.c_str());
+			exit(1);
+		}
+		bool sparse = (format == 's');
+		t = 0;
+		TIMER_BEGIN(1);
+		long long bytes = preload_segment_index(DEDUP_INDEX_DIR, files_per_seg, sparse);
+		TIMER_END(1, t);
+		if (bytes < 0) {
+			fprintf(stderr, "cannot load the %s segment index for %d files/segment; build it with 'destor -o -P %d%s'\n",
+			        sparse ? "sparse" : "dense", files_per_seg, files_per_seg, sparse ? " -S" : "");
+			exit(1);
+		}
+		printf("startup: segment index %d/%s load time: %.6f (%lld bytes locked)\n",
+		       files_per_seg, sparse ? "sparse" : "dense", t / 1000000, bytes);
+		seg_loaded.insert({files_per_seg, sparse});
+	}
+	puts("==== SERVER READY ====");
+	fflush(stdout);
+
+	std::string line;
+	while (std::getline(std::cin, line)) {
+		std::istringstream request(line);
+		std::string cmd;
+		request >> cmd;
+		if (cmd.empty())
+			continue;
+		if (cmd == "quit")
+			break;
+
+		int files_per_seg = 0;
+		std::string format;
+		if (cmd == "j")
+			request >> files_per_seg >> format;
+		std::string query;
+		std::getline(request >> std::ws, query);
+
+		ProcessIo before = process_io();
+		reset_query_timers();
+		try {
+			if (query.empty()) {
+				printf("error: request '%s' has no query\n", line.c_str());
+			} else if (cmd == "i") {
+				do_deduplicated_NOT_lookup(query);
+			} else if (cmd == "k") {
+				if (have_naive)
+					do_naive_lookup_using_parser(query);
+				else
+					printf("error: there is no naive index\n");
+			} else if (cmd == "j") {
+				bool sparse = (format == "s");
+				// A segment index read on demand would put its load into
+				// this query; only serve the ones read at startup.
+				if ((format != "d" && format != "s") || !seg_loaded.count({files_per_seg, sparse}))
+					printf("error: segment index '%d%s' was not loaded at startup (--serve-seg)\n",
+					       files_per_seg, format.c_str());
+				else
+					do_deduplicated_NOT_lookup_seg_filter(query, files_per_seg, sparse);
+			} else {
+				printf("error: unknown request '%s'\n", cmd.c_str());
+			}
+		} catch (LuceneException& e) {
+			printf("error: %s\n", StringUtils::toUTF8(e.getError()).c_str());
+		}
+		ProcessIo after = process_io();
+		printf("query major faults: %ld\n", after.majflt - before.majflt);
+		printf("query minor faults: %ld\n", after.minflt - before.minflt);
+		printf("query read bytes: %lld\n", after.read_bytes - before.read_bytes);
+		puts("==== QUERY END ====");
+		fflush(stdout);
+	}
+
+	close_pathstore();
+	pathstore_resident = false;
 }
 
 void do_deduplicated_AND_lookup(unsigned char **keywords, size_t keywords_num) {

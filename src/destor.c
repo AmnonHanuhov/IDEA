@@ -31,6 +31,7 @@ extern void do_deduplicated_lookup_using_parser(const std::string& query);
 extern void do_naive_lookup_using_parser(const std::string& query);
 extern void do_deduplicated_NOT_lookup(const std::string& query);
 extern void do_deduplicated_NOT_lookup_seg_filter(const std::string& query, int files_per_seg, bool sparse);
+extern void do_serve(const char* seg_spec);
 extern void do_deduplicated_AND_lookup(unsigned char **keywords_p, size_t keywords_num_p);
 
 extern int load_config();
@@ -47,6 +48,8 @@ int job;
 const char * const short_options = "edyzsr:t:p:hlikvqnf:mgabcjoP:SW";
 
 #define OPT_AND_IMPL 1001
+#define OPT_SERVE 1002
+#define OPT_SERVE_SEG 1003
 
 struct option long_options[] = {
 		{ "state", 0, NULL, 's' },
@@ -73,6 +76,8 @@ struct option long_options[] = {
 		{ "seg-sparse", 0, NULL, 'S'},
 		{ "seg-prefault", 0, NULL, 'W'},
 		{ "and-impl", required_argument, NULL, OPT_AND_IMPL },
+		{ "serve", 0, NULL, OPT_SERVE },
+		{ "serve-seg", required_argument, NULL, OPT_SERVE_SEG },
 		{ NULL, 0, NULL, 0 }
 };
 
@@ -124,6 +129,10 @@ void usage() {
 	puts("\tDedup NOT lookup");
 	puts("\t\tdestor -i <query> ...");
 	puts("\t\tUse at end of command only!");
+
+	puts("\tQuery server: open the indexes once, then answer queries from stdin");
+	puts("\t\tdestor --serve [--serve-seg 1024d,1024s,...]");
+	puts("\t\tone request per line: 'i <query>', 'k <query>', 'j <files/seg> <d|s> <query>', 'quit'");
 
 	exit(0);
 }
@@ -410,6 +419,7 @@ int main(int argc, char **argv) {
 	size_t keywords_num; // DedupSearch
 	size_t keywords_length = 0;
 	sds keywords_file = NULL;
+	const char* serve_seg = NULL;   /* segment indexes the query server loads */
 
 	int opt = 0;
 	while ((opt = getopt_long(argc, argv, short_options, long_options, NULL))
@@ -527,6 +537,12 @@ int main(int argc, char **argv) {
 			}
 			break;
 		}
+		case OPT_SERVE:
+			job = DESTOR_SERVE;
+			break;
+		case OPT_SERVE_SEG:
+			serve_seg = optarg;
+			break;
 		default:
 			printf("failed to find option %c, exiting\n", (char)opt);
 			return 1;
@@ -649,6 +665,9 @@ int main(int argc, char **argv) {
 		do_deduplicated_NOT_lookup_seg_filter(query, destor.seg_files_per_seg, destor.seg_sparse);
 		break;
 	}
+	case DESTOR_SERVE:
+		do_serve(serve_seg);
+		break;
 	case DESTOR_BUILD_SEG_BITMASK:
 		if (destor.seg_sparse)
 			saveSegmentBitmaskSparse(std::string(DEDUP_INDEX_DIR), destor.seg_files_per_seg);

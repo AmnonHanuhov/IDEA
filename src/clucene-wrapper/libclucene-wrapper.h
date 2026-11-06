@@ -61,6 +61,17 @@ std::map<std::string, std::vector<uint64_t>> search_keywords_in_index_with_globa
 std::map<std::string, double> search_keywords_in_index_with_scores(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 std::map<std::string, uint32_t> search_keywords_in_index_with_termfreqs(const std::vector<std::string>& keywords, const std::string& index, SyncQueue* queue = nullptr);
 
+// The query server (destor --serve) opens these once at startup; every query
+// then uses them instead of opening its own.
+// Opens the index and reads its norms; returns its number of documents.
+int32_t open_resident_index(const std::string& index);
+void open_resident_reverse_mapping();
+// Reads the segment index into memory and locks it there; returns its size in
+// bytes, or -1 if it is missing or unusable.
+long long preload_segment_index(const std::string& index_path, int files_per_seg, bool sparse);
+// Zeroes the timers that accumulate across the queries of one process.
+void reset_query_timers();
+
 // debug
 void print_terms(const std::string& index);
 
